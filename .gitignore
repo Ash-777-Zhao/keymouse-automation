@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+# 本机的热键配置，不该跟着仓库走
+settings.json
+
+# 自己录的宏
+macros/
+
+# 编辑器 / 系统杂物
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

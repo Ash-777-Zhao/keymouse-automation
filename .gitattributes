@@ -1,0 +1,11 @@
+# 批处理文件必须始终是 CRLF。
+#
+# 背景：cmd.exe 按字节偏移读取 bat 文件，UTF-8 中文配合 LF 行尾会让它算错
+# 行边界，把 echo 和下一行的内容粘在一起当命令执行，表现为窗口一闪而过。
+# 所以 启动.bat 保持纯 ASCII + CRLF，并且在这里钉死行尾，
+# 保证无论用 clone 还是从 GitHub 下 ZIP，拿到的都是 CRLF 版本。
+*.bat text eol=crlf
+
+# 其余源码统一 LF
+*.py text eol=lf
+*.md text eol=lf
