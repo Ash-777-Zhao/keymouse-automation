@@ -21,6 +21,7 @@ TICK_MS = 100
 MAX_ROWS = 3000  # 列表最多渲染这么多行，再多只是拖慢界面
 
 SETTINGS_FILE = "settings.json"
+LOG_FILE = "error.log"
 
 # pynput 的热键写法：'<f9>' 表示 F9，单个字符直接写 'a'
 DEFAULT_HOTKEYS = {"record": "<f9>", "play": "<f10>", "stop": "<f11>", "pick": "<f8>"}
@@ -1186,11 +1187,118 @@ class MacroApp:
         self.root.destroy()
 
 
+def _script_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+class _LazyLogStream:
+    """写到日志文件的流，但**第一次真正写入时才建文件**。
+
+    这样"error.log 存在"本身就等于"确实出过东西"，而不是每次启动都留一个
+    空文件误导人。pythonw 下没有控制台，这份日志是仅剩的线索。
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._handle = None
+
+    def _open(self):
+        if self._handle is None:
+            self._handle = open(self.path, "w", encoding="utf-8", errors="replace")
+        return self._handle
+
+    def write(self, data: str) -> int:
+        if not data:
+            return 0
+        try:
+            return self._open().write(data)
+        except OSError:
+            return 0
+
+    def flush(self) -> None:
+        if self._handle is not None:
+            try:
+                self._handle.flush()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
+    def isatty(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    @property
+    def encoding(self) -> str:
+        return "utf-8"
+
+
+def _ensure_streams() -> _LazyLogStream:
+    """给 sys.stdout / sys.stderr 兜个底。
+
+    pythonw.exe（无控制台解释器）下这两个是 None，任何 print 或者第三方库
+    往标准错误写日志都会抛 AttributeError。启动脚本用的正是 pythonw，
+    所以必须先把它们换成真实对象。
+    """
+    stream = _LazyLogStream(os.path.join(_script_dir(), LOG_FILE))
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = stream
+    return stream
+
+
+_shown_failure = False
+
+
+def _report_failure(exc: BaseException, stream: _LazyLogStream | None = None, *, where: str = "启动") -> None:
+    """出错了就写日志 + 弹框。
+
+    没有控制台的时候，静默退出对用户来说就是"双击没反应"，最难排查，
+    所以宁可弹个框。同一个进程里只弹一次，免得回调反复出错时刷屏。
+    """
+    global _shown_failure
+    import traceback
+
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    path = os.path.join(_script_dir(), LOG_FILE)
+    target = stream if stream is not None else sys.stderr
+    try:
+        if target is not None and hasattr(target, "write"):
+            target.write(f"===== {where}失败 =====\n{detail}\n")
+            if hasattr(target, "flush"):
+                target.flush()
+    except Exception:
+        path = "（日志文件写不进去）"
+
+    if _shown_failure:
+        return
+    _shown_failure = True
+    try:
+        messagebox.showerror(f"{where}失败", f"{exc}\n\n完整信息已写入：\n{path}")
+    except Exception:
+        pass
+
+
 def main() -> int:
-    root = tk.Tk()
-    _apply_scaling(root)
-    MacroApp(root)
-    root.mainloop()
+    stream = _ensure_streams()
+    try:
+        root = tk.Tk()
+        _apply_scaling(root)
+        # 界面回调里冒出来的异常默认只打印到标准错误，没有控制台就彻底丢了
+        root.report_callback_exception = lambda exc, val, tb: _report_failure(
+            val, stream, where="运行"
+        )
+        MacroApp(root)
+        root.mainloop()
+    except BaseException as exc:  # noqa: BLE001 - 入口处统一兜底并告知用户
+        _report_failure(exc, stream)
+        return 1
     return 0
 
 

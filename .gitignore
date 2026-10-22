@@ -4,6 +4,9 @@ __pycache__/
 # 本机的热键配置，不该跟着仓库走
 settings.json
 
+# 启动/运行出错时才会生成的日志
+error.log
+
 # 自己录的宏
 macros/
 

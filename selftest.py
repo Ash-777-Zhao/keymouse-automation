@@ -1404,6 +1404,88 @@ def test_step_dialog() -> None:
     check("对话框测试结束", True)
 
 
+def test_startup_logging() -> None:
+    print("\n[启动日志]")
+
+    import mouse_macro
+
+    # 惰性日志流：没写东西就不该建文件，否则每次启动都留个空 error.log 误导人
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "error.log")
+        stream = mouse_macro._LazyLogStream(path)
+        check("刚建流时不生成文件", not os.path.exists(path))
+        stream.write("")
+        stream.flush()
+        check("写空内容也不生成文件", not os.path.exists(path))
+        stream.write("有内容了")
+        stream.flush()
+        check("真写内容时才生成文件", os.path.exists(path))
+        with open(path, encoding="utf-8") as fh:
+            check("内容写进去了", fh.read() == "有内容了")
+        stream.close()
+
+    # 出错上报：写日志 + 弹一次框
+    popped: list = []
+    original_show = mouse_macro.messagebox.showerror
+    original_flag = mouse_macro._shown_failure
+    mouse_macro.messagebox.showerror = lambda *a, **k: popped.append(a)
+    mouse_macro._shown_failure = False
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "error.log")
+            stream = mouse_macro._LazyLogStream(path)
+
+            try:
+                raise ValueError("测试用异常")
+            except ValueError as exc:
+                mouse_macro._report_failure(exc, stream, where="启动")
+            stream.flush()
+
+            with open(path, encoding="utf-8") as fh:
+                content = fh.read()
+            check("失败时才写日志", os.path.exists(path))
+            check("日志含标题", "启动失败" in content, content[:40])
+            check("日志含异常信息", "测试用异常" in content)
+            check("日志含堆栈", "Traceback" in content)
+            check("会弹一次提示框", len(popped) == 1, str(len(popped)))
+
+            try:
+                raise RuntimeError("第二次出错")
+            except RuntimeError as exc:
+                mouse_macro._report_failure(exc, stream, where="运行")
+            stream.flush()
+            with open(path, encoding="utf-8") as fh:
+                content = fh.read()
+            check("第二次不再重复弹框", len(popped) == 1, str(len(popped)))
+            check("第二次仍然记进日志", "第二次出错" in content)
+            check("第一次的也还在", "测试用异常" in content)
+            stream.close()
+    finally:
+        mouse_macro.messagebox.showerror = original_show
+        mouse_macro._shown_failure = original_flag
+
+    # pythonw 下 sys.stdout / sys.stderr 是 None，print 会直接抛 AttributeError
+    saved_out, saved_err = sys.stdout, sys.stderr
+    try:
+        sys.stdout = None
+        sys.stderr = None
+        mouse_macro._ensure_streams()
+        ok_stdout = sys.stdout is not None
+        ok_stderr = sys.stderr is not None
+        try:
+            print("这一行在 pythonw 下不该抛异常")
+            ok_print = True
+        except Exception:
+            ok_print = False
+    finally:
+        sys.stdout, sys.stderr = saved_out, saved_err
+
+    check("pythonw 下会补上 stdout", ok_stdout)
+    check("pythonw 下会补上 stderr", ok_stderr)
+    check("pythonw 下 print 不再抛异常", ok_print)
+
+
 def test_main_entry() -> None:
     print("\n[入口]")
     import mouse_macro
@@ -1625,6 +1707,7 @@ def main() -> int:
     test_editing()
     test_script_tab()
     test_step_dialog()
+    test_startup_logging()
     test_main_entry()
 
     print(f"\n通过 {PASSED} 项，失败 {len(FAILED)} 项。")
