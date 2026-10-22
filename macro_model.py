@@ -10,15 +10,18 @@ import os
 from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
+from keyinput import pretty_keys
+
 SCHEMA_VERSION = 1
 
 KIND_MOVE = "move"
 KIND_DOWN = "down"
 KIND_UP = "up"
 KIND_SCROLL = "scroll"
-KIND_TYPE = "type"  # 键盘输入一段文字，由剧本步骤展开而来
+KIND_TYPE = "type"  # 键盘输入一段文字
+KIND_KEYS = "keys"  # 键盘按一组按键（快捷键 / 功能键）
 
-VALID_KINDS = (KIND_MOVE, KIND_DOWN, KIND_UP, KIND_SCROLL, KIND_TYPE)
+VALID_KINDS = (KIND_MOVE, KIND_DOWN, KIND_UP, KIND_SCROLL, KIND_TYPE, KIND_KEYS)
 
 # 文件里区分两种内容：录制出来的一串动作，还是手写的剧本步骤
 KIND_RECORDING = "recording"
@@ -54,6 +57,8 @@ class Action:
         if self.kind == KIND_TYPE:
             shown = self.text if len(self.text) <= 12 else self.text[:12] + "…"
             return f"输入 {shown}"
+        if self.kind == KIND_KEYS:
+            return f"按键 {pretty_keys(self.text)}"
         if self.kind == KIND_DOWN:
             return f"{_BUTTON_CN.get(self.button, self.button)}按下"
         if self.kind == KIND_UP:
@@ -98,7 +103,7 @@ def _action_to_dict(a: Action) -> dict[str, Any]:
     if a.kind == KIND_SCROLL:
         d["dx"] = a.dx
         d["dy"] = a.dy
-    if a.kind == KIND_TYPE:
+    if a.kind in (KIND_TYPE, KIND_KEYS):
         d["text"] = a.text
     return d
 
@@ -134,7 +139,7 @@ def _parse_action(raw: Any, index: int) -> Action:
         button=button,
         dx=clamp_int(raw.get("dx"), -1000, 1000),
         dy=clamp_int(raw.get("dy"), -1000, 1000),
-        text=str(raw.get("text") or "")[:2000] if kind == KIND_TYPE else "",
+        text=str(raw.get("text") or "")[:2000] if kind in (KIND_TYPE, KIND_KEYS) else "",
     )
 
 

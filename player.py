@@ -18,6 +18,7 @@ from pynput.mouse import Button, Controller
 from keyinput import Typist
 from macro_model import (
     KIND_DOWN,
+    KIND_KEYS,
     KIND_MOVE,
     KIND_SCROLL,
     KIND_TYPE,
@@ -189,7 +190,7 @@ class Player:
             self._controller.position = (action.x, action.y)
             self._controller.scroll(action.dx, action.dy)
         elif action.kind == KIND_TYPE:
-            self._controller.position = (action.x, action.y)
+            # 键盘动作不动鼠标：文字是发给当前焦点窗口的，跟坐标没关系
             if self._typist is None:
                 raise RuntimeError("键盘输入不可用，无法执行输入动作。")
             # 打字速度也跟着倍速走，否则整个时间轴会前后对不上
@@ -199,6 +200,10 @@ class Player:
                 should_stop=self._stop.is_set,
                 native=self._native_typing,
             )
+        elif action.kind == KIND_KEYS:
+            if self._typist is None:
+                raise RuntimeError("键盘输入不可用，无法执行按键动作。")
+            self._typist.press_keys(action.text)
 
     def _sleep(self, seconds: float) -> bool:
         """分片睡眠，以便随时响应停止。返回 False 表示被打断。"""

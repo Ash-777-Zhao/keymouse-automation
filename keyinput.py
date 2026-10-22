@@ -84,6 +84,189 @@ def can_type_natively(char: str) -> bool:
     return len(char) == 1 and _user32.VkKeyScanW(char) != -1
 
 
+# --- 按键组合 -------------------------------------------------------------
+# 写法沿用 pynput 的习惯：'<ctrl>+<shift>+a'、'<f5>'、'<enter>'。
+# 单字符直接写字符本身，功能键和修饰键用尖括号。
+
+MODIFIER_ORDER = ("ctrl", "alt", "shift", "cmd")
+
+_MODIFIER_NAMES = {
+    "ctrl": "ctrl",
+    "ctrl_l": "ctrl",
+    "ctrl_r": "ctrl",
+    "alt": "alt",
+    "alt_l": "alt",
+    "alt_r": "alt",
+    "alt_gr": "alt",
+    "shift": "shift",
+    "shift_l": "shift",
+    "shift_r": "shift",
+    "cmd": "cmd",
+    "cmd_l": "cmd",
+    "cmd_r": "cmd",
+}
+
+_KEY_CN = {
+    "enter": "Enter",
+    "tab": "Tab",
+    "esc": "Esc",
+    "space": "空格",
+    "backspace": "Backspace",
+    "delete": "Delete",
+    "insert": "Insert",
+    "home": "Home",
+    "end": "End",
+    "page_up": "PageUp",
+    "page_down": "PageDown",
+    "up": "↑",
+    "down": "↓",
+    "left": "←",
+    "right": "→",
+    "caps_lock": "CapsLock",
+    "num_lock": "NumLock",
+    "scroll_lock": "ScrollLock",
+    "print_screen": "PrintScreen",
+    "pause": "Pause",
+    "menu": "菜单键",
+    "cmd": "Win",
+    "ctrl": "Ctrl",
+    "alt": "Alt",
+    "shift": "Shift",
+}
+for _i in range(1, 25):
+    _KEY_CN[f"f{_i}"] = f"F{_i}"
+
+
+def pretty_keys(spec: str) -> str:
+    """把 '<ctrl>+<shift>+a' 显示成 'Ctrl + Shift + A'。"""
+    if not spec:
+        return ""
+    parts = []
+    for token in spec.split("+"):
+        token = token.strip()
+        if not token:
+            continue
+        if token.startswith("<") and token.endswith(">"):
+            name = token[1:-1].lower()
+            parts.append(_KEY_CN.get(name, name.replace("_", " ").title()))
+        else:
+            parts.append(token.upper() if len(token) == 1 else token)
+    return " + ".join(parts)
+
+
+def modifier_name(key) -> str | None:
+    """按键对象是修饰键的话返回它的规范名，否则 None。"""
+    name = getattr(key, "name", None)
+    return _MODIFIER_NAMES.get(name) if name else None
+
+
+def key_token(key) -> str | None:
+    """把 pynput 的按键对象转成 spec 里的一段。"""
+    name = getattr(key, "name", None)
+    if name:
+        return f"<{name}>"
+    char = getattr(key, "char", None)
+    if char:
+        return char.lower()
+    vk = getattr(key, "vk", None)
+    return f"<{vk}>" if vk else None
+
+
+def build_spec(modifiers, key) -> str | None:
+    """按规范顺序拼出组合键写法。modifiers 是捕获期间按住的修饰键名集合。"""
+    token = key_token(key)
+    if token is None:
+        return None
+    ordered = [f"<{name}>" for name in MODIFIER_ORDER if name in modifiers]
+    return "+".join(ordered + [token])
+
+
+_MODIFIER_ORDER_INDEX = {"ctrl": 0, "alt": 1, "shift": 2, "cmd": 3}
+
+
+def parse_spec(spec: str) -> list:
+    """把组合键写法解析成 pynput 的按键对象列表，修饰键排在前面。
+
+    这里没有用 pynput 的 HotKey.parse：它返回的是 set，顺序是乱的，
+    而我们按下时必须先按修饰键再按主键，不能听天由命。
+    """
+    if not spec:
+        return []
+    from pynput.keyboard import Key, KeyCode
+
+    modifiers: list = []
+    main = None
+
+    for token in spec.split("+"):
+        token = token.strip()
+        if not token:
+            continue
+
+        if len(token) == 1:
+            main = KeyCode.from_char(token)
+            continue
+
+        if not (token.startswith("<") and token.endswith(">")):
+            return []
+
+        name = token[1:-1].lower()
+        key = getattr(Key, name, None)
+        if key is None:
+            if name.isdigit():  # 兜底：直接给虚拟键码
+                key = KeyCode.from_vk(int(name))
+            else:
+                return []
+
+        canonical = _MODIFIER_NAMES.get(name)
+        if canonical and key not in modifiers:
+            modifiers.append(key)
+        else:
+            main = key
+
+    modifiers.sort(key=lambda k: _MODIFIER_ORDER_INDEX.get(_MODIFIER_NAMES.get(k.name, ""), 9))
+    return modifiers + ([main] if main is not None else [])
+
+
+def _common_keys() -> list[tuple[str, str]]:
+    """对话框里「常用功能键」下拉的内容。"""
+    items = [
+        ("<enter>", "Enter 回车"),
+        ("<tab>", "Tab 切换焦点"),
+        ("<esc>", "Esc 取消"),
+        ("<space>", "空格"),
+        ("<backspace>", "Backspace 退格"),
+        ("<delete>", "Delete 删除"),
+        ("<up>", "方向键 ↑"),
+        ("<down>", "方向键 ↓"),
+        ("<left>", "方向键 ←"),
+        ("<right>", "方向键 →"),
+        ("<home>", "Home"),
+        ("<end>", "End"),
+        ("<page_up>", "PageUp"),
+        ("<page_down>", "PageDown"),
+        ("<cmd>", "Win 键"),
+        ("<print_screen>", "PrintScreen"),
+    ]
+    items += [(f"<f{i}>", f"F{i}") for i in range(1, 13)]
+    items += [
+        ("<ctrl>+c", "Ctrl + C 复制"),
+        ("<ctrl>+v", "Ctrl + V 粘贴"),
+        ("<ctrl>+x", "Ctrl + X 剪切"),
+        ("<ctrl>+z", "Ctrl + Z 撤销"),
+        ("<ctrl>+a", "Ctrl + A 全选"),
+        ("<ctrl>+s", "Ctrl + S 保存"),
+        ("<ctrl>+f", "Ctrl + F 查找"),
+        ("<ctrl>+w", "Ctrl + W 关闭标签页"),
+        ("<alt>+<tab>", "Alt + Tab 切换窗口"),
+        ("<alt>+<f4>", "Alt + F4 关闭窗口"),
+        ("<ctrl>+<shift>+<esc>", "Ctrl + Shift + Esc 任务管理器"),
+    ]
+    return items
+
+
+COMMON_KEYS = _common_keys()
+
+
 class Typist:
     """按字符发键盘输入。持有 pynput 的键盘控制器。"""
 
@@ -148,3 +331,27 @@ class Typist:
             return True
         except Exception:
             return False
+
+    def press_keys(self, spec: str) -> None:
+        """按一下一组按键，比如 Ctrl+C 或 F5。
+
+        快捷键只能走模拟真实按键，没得选：Unicode 通道只产生字符，
+        产生不了 Ctrl 这种修饰键，也产生不了 F5 这种没有字符对应物的键。
+        """
+        keys = parse_spec(spec)
+        if not keys:
+            raise RuntimeError(f"按键写法无法识别：{spec!r}")
+
+        pressed: list = []
+        try:
+            for key in keys:
+                self._controller.press(key)
+                pressed.append(key)
+        finally:
+            # 无论成功还是中途出错，都要把按下的键放开，
+            # 否则会留下一个卡住的 Ctrl，后面所有操作都变味
+            for key in reversed(pressed):
+                try:
+                    self._controller.release(key)
+                except Exception:
+                    pass

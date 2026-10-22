@@ -293,19 +293,19 @@ class MacroApp:
         area = ttk.Frame(parent)
         area.pack(fill="both", expand=True)
 
-        columns = ("idx", "pos", "mouse", "text", "delay")
+        columns = ("idx", "kind", "pos", "action", "delay")
         self.step_tree = ttk.Treeview(
             area, columns=columns, show="headings", selectmode="extended"
         )
         self.step_tree.heading("idx", text="#")
+        self.step_tree.heading("kind", text="类型")
         self.step_tree.heading("pos", text="坐标")
-        self.step_tree.heading("mouse", text="鼠标动作")
-        self.step_tree.heading("text", text="输入文字")
+        self.step_tree.heading("action", text="动作")
         self.step_tree.heading("delay", text="执行后等待")
         self.step_tree.column("idx", width=44, anchor="e", stretch=False)
-        self.step_tree.column("pos", width=130, anchor="w", stretch=False)
-        self.step_tree.column("mouse", width=90, anchor="w", stretch=False)
-        self.step_tree.column("text", width=140, anchor="w")
+        self.step_tree.column("kind", width=52, anchor="w", stretch=False)
+        self.step_tree.column("pos", width=120, anchor="w", stretch=False)
+        self.step_tree.column("action", width=220, anchor="w")
         self.step_tree.column("delay", width=90, anchor="e", stretch=False)
 
         scrollbar = ttk.Scrollbar(area, orient="vertical", command=self.step_tree.yview)
@@ -349,15 +349,14 @@ class MacroApp:
         self.step_tree.delete(*self.step_tree.get_children())
         self._on_step_selection_change()
         for index, step in enumerate(self.steps[:MAX_ROWS]):
-            shown = step.text if len(step.text) <= 20 else step.text[:20] + "…"
             self.step_tree.insert(
                 "",
                 "end",
                 values=(
                     index + 1,
-                    f"{step.x}, {step.y}",
-                    step.mouse_label(),
-                    shown or "—",
+                    step.kind_label(),
+                    step.position_label(),
+                    step.action_label(),
                     f"{step.delay_ms} ms",
                 ),
             )

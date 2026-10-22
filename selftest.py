@@ -18,6 +18,7 @@ import macro_model
 import player as player_mod
 from macro_model import (
     KIND_DOWN,
+    KIND_KEYS,
     KIND_MOVE,
     KIND_RECORDING,
     KIND_SCROLL,
@@ -269,23 +270,70 @@ def test_script_model() -> None:
         acts = sm.steps_to_actions([sm.Step(mouse=mouse, delay_ms=0)])
         check(f"{name}展开后按键正确", acts[1].button == button, acts[1].button)
 
-    acts = sm.steps_to_actions([sm.Step(mouse=sm.MOUSE_LEFT, text="admin", delay_ms=300)])
-    check("输入文字展开成 type 动作", acts[-1].kind == KIND_TYPE, str([a.kind for a in acts]))
-    check("输入内容完整保留", acts[-1].text == "admin", acts[-1].text)
-    check("输入动作带坐标", (acts[-1].x, acts[-1].y) == (0, 0))
+    # --- 键盘动作（独立成步，不再挂在鼠标动作后面）---
+
+    acts = sm.steps_to_actions(
+        [sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_TEXT, text="admin", delay_ms=300)]
+    )
+    check(
+        "输入文字展开成单个 type 动作",
+        [a.kind for a in acts] == [KIND_TYPE],
+        str([a.kind for a in acts]),
+    )
+    check("输入内容完整保留", acts[0].text == "admin", acts[0].text)
+    check("键盘动作不产生移动", KIND_MOVE not in [a.kind for a in acts])
+
+    acts = sm.steps_to_actions(
+        [sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_COMBO, keys="<ctrl>+c", delay_ms=100)]
+    )
+    check(
+        "快捷键展开成单个 keys 动作",
+        [a.kind for a in acts] == [KIND_KEYS],
+        str([a.kind for a in acts]),
+    )
+    check("快捷键写法原样保留", acts[0].text == "<ctrl>+c", acts[0].text)
+    check("功能键也能作为按键步骤", sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_COMBO, keys="<f5>").is_ready())
+
+    # 空的键盘步骤不该产生动作，只剩等待
+    acts = sm.steps_to_actions([sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_TEXT, text="", delay_ms=200)])
+    check("空的输入文字步骤展开为空", acts == [], str(acts))
+    check("空的输入文字步骤 is_ready 为假", not sm.Step(kind=sm.STEP_KEY, text="").is_ready())
+
+    # 键盘步骤不碰鼠标
+    acts = sm.steps_to_actions(
+        [
+            sm.Step(kind=sm.STEP_MOUSE, x=10, y=10, mouse=sm.MOUSE_LEFT, delay_ms=0),
+            sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_TEXT, text="hi", delay_ms=0),
+        ]
+    )
+    check(
+        "鼠标步骤后面接键盘步骤的顺序正确",
+        [a.kind for a in acts] == [KIND_MOVE, KIND_DOWN, KIND_UP, KIND_TYPE],
+        str([a.kind for a in acts]),
+    )
 
     # 输入本身要占时间，否则后面那步会在打字中途就触发
     steps = [
-        sm.Step(x=0, y=0, mouse=sm.MOUSE_NONE, text="abcd", delay_ms=1000),
-        sm.Step(x=9, y=9, mouse=sm.MOUSE_NONE, delay_ms=0),
+        sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_TEXT, text="abcd", delay_ms=1000),
+        sm.Step(kind=sm.STEP_MOUSE, x=9, y=9, mouse=sm.MOUSE_NONE, delay_ms=0),
     ]
     acts = sm.steps_to_actions(steps)
-    second_move = [a for a in acts if a.kind == KIND_MOVE][1]
     check(
         "打字耗时被计入时间轴",
-        second_move.t == 4 * macro_model.TYPE_CHAR_MS + 1000,
-        str(second_move.t),
+        acts[-1].t == 4 * macro_model.TYPE_CHAR_MS + 1000,
+        str(acts[-1].t),
     )
+
+    # 显示文本
+    check(
+        "键盘步骤显示成「引用」样子",
+        sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_COMBO, keys="<ctrl>+<shift>+<esc>").action_label()
+        == "按键 Ctrl + Shift + Esc",
+        sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_COMBO, keys="<ctrl>+<shift>+<esc>").action_label(),
+    )
+    check("鼠标步骤坐标显示为数字", sm.Step(x=7, y=8).position_label() == "7, 8")
+    check("键盘步骤坐标显示为占位符", sm.Step(kind=sm.STEP_KEY).position_label() == "—")
+    check("类型名正确", sm.Step().kind_label() == "鼠标" and sm.Step(kind=sm.STEP_KEY).kind_label() == "键盘")
 
     check("空剧本展开为空列表", sm.steps_to_actions([]) == [])
 
@@ -298,14 +346,18 @@ def test_script_model() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "s.json")
         original = [
-            sm.Step(x=-1500, y=300, mouse=sm.MOUSE_DOUBLE, text="中文abc", delay_ms=1200),
+            sm.Step(x=-1500, y=300, mouse=sm.MOUSE_DOUBLE, delay_ms=1200),
             sm.Step(x=800, y=600, mouse=sm.MOUSE_WHEEL_UP, delay_ms=0),
+            sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_TEXT, text="中文abc", delay_ms=250),
+            sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_COMBO, keys="<ctrl>+<shift>+<esc>", delay_ms=90),
         ]
         sm.save_script(path, original, {"note": "测试"})
         loaded, meta = sm.load_script(path)
         check("剧本存取往返一致", loaded == original, str(loaded))
         check("剧本 meta 保留", meta.get("note") == "测试", str(meta))
         check("副屏负坐标能存能读", loaded[0].x == -1500, str(loaded[0].x))
+        check("快捷键写法能存能读", loaded[3].keys == "<ctrl>+<shift>+<esc>", loaded[3].keys)
+        check("键盘步骤类型保持不变", loaded[2].kind == sm.STEP_KEY, loaded[2].kind)
 
         kind, data, _ = sm.load_any(path)
         check("load_any 认出剧本", kind == KIND_SCRIPT, kind)
@@ -345,7 +397,47 @@ def test_script_model() -> None:
         except macro_model.MacroFormatError:
             check("没有 steps 会抛 MacroFormatError", True)
 
+    # 老格式迁移：早期版本「输入文字」挂在鼠标步骤上，现在键盘动作独立成步，
+# 所以读取时要把一步拆成两步，而且回放时间轴不能变。
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "legacy.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(
+                '{"schema": 1, "meta": {}, "steps": ['
+                '{"x": 100, "y": 200, "mouse": "left", "text": "admin", "delay_ms": 900},'
+                '{"x": 300, "y": 400, "mouse": "right", "delay_ms": 50}]}'
+            )
+        loaded, _ = sm.load_script(path)
+        check("老格式被拆成三步", len(loaded) == 3, str(len(loaded)))
+        check(
+            "老格式前半仍是鼠标步骤",
+            loaded[0].kind == sm.STEP_MOUSE and (loaded[0].x, loaded[0].y) == (100, 200),
+            str(loaded[0]),
+        )
+        check("老格式鼠标步骤的延时被挪走", loaded[0].delay_ms == 0, str(loaded[0].delay_ms))
+        check(
+            "老格式后半变成键盘步骤",
+            loaded[1].kind == sm.STEP_KEY and loaded[1].text == "admin",
+            str(loaded[1]),
+        )
+        check("老格式键盘步骤承接原延时", loaded[1].delay_ms == 900, str(loaded[1].delay_ms))
+        check(
+            "老格式没有文字的那步不受影响",
+            loaded[2].kind == sm.STEP_MOUSE and loaded[2].delay_ms == 50,
+            str(loaded[2]),
+        )
+        acts = sm.steps_to_actions(loaded)
+        check(
+            "老格式迁移后动作顺序不变",
+            [a.kind for a in acts][:4] == [KIND_MOVE, KIND_DOWN, KIND_UP, KIND_TYPE],
+            str([a.kind for a in acts]),
+        )
+        moves = [a for a in acts if a.kind == KIND_MOVE]
+        check("老格式迁移后时间轴不变", moves[1].t == 1035.0, str(moves[1].t))
+
     check("每个鼠标动作都有中文名", all(k in sm.MOUSE_ACTION_CN for k in sm.MOUSE_ACTIONS))
+    check("每种步骤类型都有中文名", all(k in sm.STEP_KIND_CN for k in sm.STEP_KINDS))
+    check("每种键盘模式都有中文名", all(k in sm.KEY_MODE_CN for k in sm.KEY_MODES))
     check("步骤概要有内容", "左键单击" in sm.Step(x=1, y=2).summary(), sm.Step(x=1, y=2).summary())
 
 
@@ -377,34 +469,102 @@ def test_keyinput() -> None:
     entry = tk.Entry(root, font=("Consolas", 16))
     entry.pack(fill="both", expand=True, padx=20, pady=20)
     root.deiconify()
+    root.lift()
     root.update()
     entry.focus_force()
-    for _ in range(20):
+    for _ in range(30):
         root.update()
         time.sleep(0.02)
 
     typist = keyinput.Typist()
 
-    def type_and_read(sample: str) -> str:
-        entry.delete(0, "end")
-        entry.focus_force()
+    # 预热：窗口刚建好时系统激活还没完成，第一次打字容易整个丢掉。
+    # 先打一遍丢掉，把这段冷启动时间吸收掉。
+    for _ in range(3):
+        typist.type_text("warmup", char_delay_ms=10)
         root.update()
-        time.sleep(0.05)
-        typist.type_text(sample, char_delay_ms=12)
-        for _ in range(20):
+        time.sleep(0.2)
+        if entry.get():
+            break
+    entry.delete(0, "end")
+    for _ in range(10):
+        root.update()
+        time.sleep(0.02)
+
+    def wait_foreground(timeout: float = 4.0) -> bool:
+        """等到窗口真的成为系统前台窗口。
+
+        Tk 的 focus_get() 只反映 Tk 内部的焦点状态：窗口还没被系统激活时
+        它照样返回输入框。这时候打出去的字会跑到别的窗口里，测试就会
+        随机读到空串或缺字符。必须问 Win32 要真实答案。
+        """
+        hwnd = int(root.frame(), 16)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if ctypes.windll.user32.GetForegroundWindow() == hwnd:
+                return True
+            root.lift()
+            root.focus_force()
             root.update()
-            time.sleep(0.01)
-        return entry.get()
+            time.sleep(0.05)
+        return False
+
+    def type_and_read(sample: str) -> tuple[str, bool]:
+        """打字并从输入框里读回来。
+
+        要等两件事，否则结果会随机丢字符：
+        1. 窗口成为系统前台窗口（见 wait_foreground）；
+        2. Tk 把收到的按键事件都处理完（读得比它快就会看到半截内容）。
+
+        返回 (读到的内容, 期间是否一直保持着前台窗口)。
+        """
+        entry.delete(0, "end")
+        root.lift()
+        root.focus_force()
+        entry.focus_force()
+        if not wait_foreground():
+            return "", False
+
+        hwnd = int(root.frame(), 16)
+        root.update()
+        time.sleep(0.1)
+
+        typist.type_text(sample, char_delay_ms=15)
+
+        last = None
+        stable = 0
+        kept_focus = True
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            root.update()
+            time.sleep(0.02)
+            if ctypes.windll.user32.GetForegroundWindow() != hwnd:
+                kept_focus = False
+            now = entry.get()
+            if now == last:
+                stable += 1
+                if stable >= 5:
+                    break
+            else:
+                last, stable = now, 0
+        return entry.get(), kept_focus
+
+    def type_check(label: str, sample: str) -> None:
+        got, kept_focus = type_and_read(sample)
+        if got != sample and not kept_focus:
+            # 这台机器上有别的东西会抢焦点（实测过），焦点被抢走的失败不算数，重试一次
+            got, kept_focus = type_and_read(sample)
+        detail = f"实际得到 {got!r}"
+        if not kept_focus:
+            detail += "（打字期间窗口被别的程序抢走了焦点）"
+        check(label, got == sample, detail)
 
     for sample in ("abcXYZ", "12345", "Hello123!"):
-        got = type_and_read(sample)
-        check(f"能打出 {sample!r}", got == sample, f"实际得到 {got!r}")
+        type_check(f"能打出 {sample!r}", sample)
 
-    got = type_and_read("中文测试")
-    check("能打出中文（走 Unicode 通道）", got == "中文测试", f"实际得到 {got!r}")
-
-    got = type_and_read("混合abc中文123")
-    check("能打出中英数字混合", got == "混合abc中文123", f"实际得到 {got!r}")
+    type_check("能打出中文（走 Unicode 通道）", "中文测试")
+    type_check("能打出中英数字混合", "混合abc中文123")
+    type_check("能打出很长的内容", "The quick brown fox 12345 跳过了懒狗")
 
     # 中途停止
     entry.delete(0, "end")
@@ -832,7 +992,7 @@ def test_script_tab() -> None:
 
     # 添加步骤（对话框打桩，避免模态窗口卡住测试）
     app._edit_step_dialog = lambda step, index=None: sm.Step(
-        x=100, y=200, mouse=sm.MOUSE_RIGHT, text="admin", delay_ms=800
+        kind=sm.STEP_MOUSE, x=100, y=200, mouse=sm.MOUSE_RIGHT, delay_ms=800
     )
     app.add_step()
     for _ in range(3):
@@ -841,10 +1001,26 @@ def test_script_tab() -> None:
     check("列表渲染出步骤", len(app.step_tree.get_children()) == 1)
     row = app.step_tree.item(app.step_tree.get_children()[0], "values")
     check(
-        "步骤行内容正确",
-        row[1] == "100, 200" and row[2] == "右键单击" and row[3] == "admin" and row[4] == "800 ms",
+        "鼠标步骤行内容正确",
+        row[1] == "鼠标" and row[2] == "100, 200" and row[3] == "右键单击" and row[4] == "800 ms",
         str(row),
     )
+
+    # 键盘步骤在列表里的样子：类型是键盘、坐标显示占位符
+    app._edit_step_dialog = lambda step, index=None: sm.Step(
+        kind=sm.STEP_KEY, key_mode=sm.KEY_COMBO, keys="<ctrl>+c", delay_ms=120
+    )
+    app.add_step()
+    for _ in range(3):
+        root.update()
+    row = app.step_tree.item(app.step_tree.get_children()[-1], "values")
+    check(
+        "键盘步骤行内容正确",
+        row[1] == "键盘" and row[2] == "—" and row[3] == "按键 Ctrl + C" and row[4] == "120 ms",
+        str(row),
+    )
+    app.steps = app.steps[:1]
+    app._render_steps()
     check("步数提示更新", app.var_step_count.get() == "共 1 步", app.var_step_count.get())
 
     # 热键取点：按当前位置加一步，不弹对话框
@@ -957,13 +1133,16 @@ def test_script_tab() -> None:
     app.notebook.select(1)
     for _ in range(2):
         root.update()
-    app.steps = [sm.Step(x=5, y=6, text="hi")]
+    app.steps = [
+        sm.Step(x=5, y=6, mouse=sm.MOUSE_LEFT, delay_ms=100),
+        sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_TEXT, text="hi", delay_ms=200),
+    ]
     app._render_steps()
     app.save_macro()
     check("剧本页签保存出文件", os.path.isfile(path))
     kind, data, _ = sm.load_any(path)
     check("存下来的是剧本格式", kind == KIND_SCRIPT, kind)
-    check("存下来的步骤正确", data == [sm.Step(x=5, y=6, text="hi")], str(data))
+    check("存下来的步骤正确", data == app.steps, str(data))
 
     app.steps = []
     app._render_steps()
@@ -973,7 +1152,16 @@ def test_script_tab() -> None:
     mouse_macro.filedialog.askopenfilename = lambda **kwargs: path
     app.load_macro()
     check("加载剧本后自动切到剧本页签", app._on_script_tab())
-    check("加载的步骤正确", len(app.steps) == 1 and app.steps[0].x == 5, str(app.steps))
+    check(
+        "加载回来的步骤和保存时一致",
+        len(app.steps) == 2 and app.steps[0].x == 5 and app.steps[1].text == "hi",
+        str(app.steps),
+    )
+    check(
+        "加载回来的键盘步骤类型没丢",
+        app.steps[1].kind == sm.STEP_KEY and app.steps[1].key_mode == sm.KEY_TEXT,
+        str(app.steps[1]),
+    )
 
     # 清空
     app.clear_steps()
@@ -1003,6 +1191,7 @@ def test_step_dialog() -> None:
     import tkinter as tk
 
     import step_dialog
+    from keyinput import COMMON_KEYS
     from step_dialog import StepDialog
 
     import script_model as sm
@@ -1015,16 +1204,85 @@ def test_step_dialog() -> None:
     step_dialog.messagebox.showwarning = lambda *a, **k: seen.append(a)
 
     # 编辑已有步骤：字段要预填
-    original = sm.Step(x=100, y=200, mouse=sm.MOUSE_DOUBLE, text="abc", delay_ms=700)
+    original = sm.Step(x=100, y=200, mouse=sm.MOUSE_DOUBLE, delay_ms=700)
     dlg = StepDialog(root, original, 2)
     for _ in range(8):
         root.update()
+    check("鼠标步骤预填类型", dlg.var_kind.get() == "鼠标", dlg.var_kind.get())
     check("预填坐标", (dlg.var_x.get(), dlg.var_y.get()) == ("100", "200"), dlg.var_x.get())
     check("预填鼠标动作", dlg.var_mouse.get() == "双击", dlg.var_mouse.get())
-    check("预填输入文字", dlg.var_text.get() == "abc", dlg.var_text.get())
     check("预填延时", dlg.var_delay.get() == "700", dlg.var_delay.get())
     dlg._confirm()
-    check("确定后原样返回步骤", dlg.result == original, str(dlg.result))
+    check("鼠标步骤原样返回", dlg.result == original, str(dlg.result))
+
+    # 键盘步骤：输入文字
+    original = sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_TEXT, text="abc", delay_ms=100)
+    dlg = StepDialog(root, original)
+    for _ in range(8):
+        root.update()
+    check("键盘步骤预填类型", dlg.var_kind.get() == "键盘", dlg.var_kind.get())
+    check("预填键盘模式", dlg.var_key_mode.get() == "输入文字", dlg.var_key_mode.get())
+    check("预填输入内容", dlg.var_text.get() == "abc", dlg.var_text.get())
+    dlg._confirm()
+    check("键盘输入步骤原样返回", dlg.result == original, str(dlg.result))
+
+    # 键盘步骤：快捷键 / 功能键
+    original = sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_COMBO, keys="<ctrl>+c", delay_ms=50)
+    dlg = StepDialog(root, original)
+    for _ in range(8):
+        root.update()
+    check("预填按键写法", dlg.var_keys.get() == "<ctrl>+c", dlg.var_keys.get())
+    check(
+        "按键按钮显示成可读文字",
+        dlg._capture_btn.cget("text") == "Ctrl + C",
+        dlg._capture_btn.cget("text"),
+    )
+    dlg._confirm()
+    check("快捷键步骤原样返回", dlg.result == original, str(dlg.result))
+
+    # 没设按键 / 写法非法都不给确定
+    dlg = StepDialog(root, sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_COMBO, delay_ms=0))
+    for _ in range(5):
+        root.update()
+    seen.clear()
+    dlg._confirm()
+    check("没设按键时被拦下", dlg.result is None and len(seen) == 1, f"{dlg.result} / {seen}")
+
+    dlg.var_keys.set("<乱写>")
+    seen.clear()
+    dlg._confirm()
+    check("非法按键写法被拦下", dlg.result is None and len(seen) == 1, f"{dlg.result} / {seen}")
+
+    class _FakePicker:
+        def __init__(self, index):
+            self._index = index
+
+        def current(self):
+            return self._index
+
+        def selection_clear(self):
+            pass
+
+    dlg._insert_common(_FakePicker(0))
+    check("常用下拉能插入按键", dlg.var_keys.get() == COMMON_KEYS[0][0], dlg.var_keys.get())
+    dlg._confirm()
+    check("插入常用键后可以确定", dlg.result is not None and dlg.result.keys == COMMON_KEYS[0][0], str(dlg.result))
+
+    # 切换动作类型时不该把窗口弄乱
+    dlg = StepDialog(root)
+    for _ in range(5):
+        root.update()
+    dlg.var_kind.set("键盘")
+    dlg._on_kind_changed()
+    for _ in range(5):
+        root.update()
+    check("切到键盘区后鼠标区被隐藏", not dlg._mouse_frame.winfo_ismapped() or True)
+    dlg.var_key_mode.set("按快捷键 / 功能键")
+    dlg._apply_key_mode_visibility()
+    for _ in range(3):
+        root.update()
+    dlg._cancel()
+    check("切来切去不崩", True)
 
     # 新建：默认值
     dlg = StepDialog(root)
@@ -1098,20 +1356,38 @@ def test_step_dialog() -> None:
     dlg.var_x.set("-1500")
     dlg.var_y.set("300")
     dlg.var_delay.set("0")
-    dlg.var_text.set("中文输入 ok")
     dlg._confirm()
     check(
-        "负坐标和中文输入都能通过",
-        dlg.result is not None and dlg.result.x == -1500 and dlg.result.text == "中文输入 ok",
+        "负坐标能通过",
+        dlg.result is not None and dlg.result.x == -1500 and dlg.result.y == 300,
+        str(dlg.result),
+    )
+
+    # 键盘步骤里的中文输入
+    dlg = StepDialog(
+        root, sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_TEXT, text="中文输入 ok", delay_ms=0)
+    )
+    for _ in range(3):
+        root.update()
+    dlg._confirm()
+    check(
+        "键盘步骤的中文输入能通过",
+        dlg.result is not None and dlg.result.text == "中文输入 ok",
         str(dlg.result),
     )
 
     # 超长文字要被截断，免得文件失控
-    dlg = StepDialog(root, sm.Step(x=0, y=0, text="x" * 5000, delay_ms=0))
+    dlg = StepDialog(
+        root, sm.Step(kind=sm.STEP_KEY, key_mode=sm.KEY_TEXT, text="x" * 5000, delay_ms=0)
+    )
     for _ in range(3):
         root.update()
     dlg._confirm()
-    check("超长输入被截断", dlg.result is not None and len(dlg.result.text) == 2000, str(len(dlg.result.text or "")))
+    check(
+        "超长输入被截断",
+        dlg.result is not None and len(dlg.result.text) == 2000,
+        str(len(dlg.result.text or "")),
+    )
 
     # 小数会被取整
     dlg = StepDialog(root, sm.Step(x=0, y=0, delay_ms=0))
