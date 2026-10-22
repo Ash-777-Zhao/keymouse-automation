@@ -625,6 +625,7 @@ class MacroApp:
             self._drain()
             self._refresh_ignore_rect()
             if self.recorder.active:
+                self._watch_recorder()
                 self._update_capture_info()
             elif self._last_stats is not None:
                 self._last_stats = None
@@ -638,24 +639,57 @@ class MacroApp:
             except tk.TclError:
                 pass
 
+    def _watch_recorder(self) -> None:
+        """盯着采集钩子，死了就立刻重挂。
+
+        这一步是必须的：回调里的异常会让 pynput 静默停掉监听器，异常本身还被
+        钩子过程里的裸 except 吞掉，不主动检查的话界面只会表现为"计数不再上涨"，
+        极难排查。实测确认过——中断之后再注入事件，一个都收不到。
+        """
+        if self.recorder.listener_alive():
+            return
+        self._last_stats = None  # 强制刷新统计行
+        if not self.recorder.restart_listener():
+            self.var_status.set("⚠ 采集钩子已停止，且自动重挂失败。请停止录制后重新开始。")
+
     def _update_capture_info(self) -> None:
         """把采集器的计数显示出来，录制没反应时一眼能看出卡在哪一步。"""
         stats = self.recorder.stats()
-        key = (stats["recorded"], stats["seen"], stats["injected"], stats["window"])
+        key = (
+            stats["recorded"],
+            stats["seen"],
+            stats["injected"],
+            stats["window"],
+            stats["errors"],
+            stats["restarts"],
+        )
         if key == self._last_stats:
             return
         self._last_stats = key
 
         hotkey = _pretty_hotkey(self.hotkeys["record"])
-        if stats["seen"] == 0:
+
+        # 中断和出错要压过普通计数，否则用户根本注意不到
+        if stats["restarts"]:
+            self.var_status.set(
+                f"⚠ 录制中…… 采集钩子中断过 {stats['restarts']} 次，已自动重挂（{hotkey} 停止）"
+            )
+        elif stats["errors"]:
+            self.var_status.set(
+                f"⚠ 录制中…… 采集回调出过错 {stats['errors']} 次，已兜住未中断（{hotkey} 停止）"
+            )
+        elif stats["seen"] == 0:
             self.var_status.set(f"● 录制中…… 尚未收到任何鼠标事件（{hotkey} 停止）")
             self.var_capture_info.set(
                 "钩子收到 0 个事件 —— 如果此刻你正在移动鼠标，说明系统钩子没抓到输入。"
                 "常见原因：目标程序以管理员身份运行而本工具没有提权。"
             )
             return
+        else:
+            self.var_status.set(
+                f"● 录制中…… 已记录 {stats['recorded']} 个动作（{hotkey} 停止）"
+            )
 
-        self.var_status.set(f"● 录制中…… 已记录 {stats['recorded']} 个动作（{hotkey} 停止）")
         parts = [f"钩子收到 {stats['seen']} 个事件", f"已记录 {stats['recorded']}"]
         if stats["injected"]:
             parts.append(f"忽略注入 {stats['injected']}")
@@ -663,6 +697,10 @@ class MacroApp:
             parts.append(f"忽略本窗口 {stats['window']}")
         if stats["coalesced"]:
             parts.append(f"轨迹合并 {stats['coalesced']}")
+        if stats["restarts"]:
+            parts.append(f"⚠ 钩子重挂 {stats['restarts']} 次，中断期间的操作为丢失")
+        if stats["errors"]:
+            parts.append(f"⚠ 回调出错 {stats['errors']} 次：{stats['last_error']}")
         if stats["last"]:
             parts.append(f"最近 {stats['last']}")
         self.var_capture_info.set("  ·  ".join(parts))
@@ -861,8 +899,14 @@ class MacroApp:
         self._refresh_hotkey_labels()
         self._render_actions()
         if was_active:
+            note = ""
+            stats = self.recorder.stats()
+            if stats["restarts"]:
+                note = f"（采集钩子中断过 {stats['restarts']} 次，中断期间的操作为丢失）"
+            elif stats["errors"]:
+                note = f"（采集回调出过错 {stats['errors']} 次，已兜住）"
             self.var_status.set(
-                f"录制完成，共 {len(self.actions)} 个动作。"
+                f"录制完成，共 {len(self.actions)} 个动作{note}。"
                 f"按 {_pretty_hotkey(self.hotkeys['play'])} 回放。"
             )
         else:

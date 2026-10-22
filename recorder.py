@@ -55,6 +55,11 @@ class Recorder:
         self.coalesced = 0     # 被抽稀掉的移动点
         self.last_event = ""
 
+        # 回调里兜住的异常，以及钩子意外中断后自动重挂的次数
+        self.last_error = ""
+        self.error_count = 0
+        self.restarts = 0
+
         # 主线程每隔一小段时间刷新一次；(x, y, w, h)，命中该矩形的鼠标事件会被忽略。
         # 用来避免把点击本工具窗口的操作录进宏里。元组赋值在 CPython 里是原子的。
         self.ignore_rect: tuple[int, int, int, int] | None = None
@@ -82,6 +87,9 @@ class Recorder:
             self.skipped_window = 0
             self.coalesced = 0
             self.last_event = ""
+            self.last_error = ""
+            self.error_count = 0
+            self.restarts = 0
         self._listener = mouse.Listener(
             on_move=self._on_move,
             on_click=self._on_click,
@@ -111,7 +119,56 @@ class Recorder:
                 "window": self.skipped_window,
                 "coalesced": self.coalesced,
                 "last": self.last_event,
+                "errors": self.error_count,
+                "restarts": self.restarts,
+                "last_error": self.last_error,
             }
+
+    def listener_alive(self) -> bool:
+        """采集钩子还在工作吗。没在录制时恒为 True。
+
+        要区分"我们主动 stop 的"和"意外死掉的"：意外死亡时 _active 还是 True，
+        但 listener.running 已经变成 False。
+        """
+        with self._lock:
+            if not self._active:
+                return True
+            listener = self._listener
+        return listener is not None and bool(getattr(listener, "running", False))
+
+    def restart_listener(self) -> bool:
+        """钩子意外死亡后重新挂一个。时间轴和已记录的动作都保留。
+
+        返回是否重挂成功。失败会把原因记进 last_error。
+        """
+        with self._lock:
+            if not self._active:
+                return False
+            old, self._listener = self._listener, None
+
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:
+                pass
+
+        try:
+            listener = mouse.Listener(
+                on_move=self._on_move,
+                on_click=self._on_click,
+                on_scroll=self._on_scroll,
+            )
+            listener.start()
+        except Exception as exc:  # noqa: BLE001 - 交给界面报告
+            with self._lock:
+                self.last_error = f"重启采集钩子失败：{exc}"
+                self.error_count += 1
+            return False
+
+        with self._lock:
+            self._listener = listener
+            self.restarts += 1
+        return True
 
     # --- 内部 ---
 
@@ -137,7 +194,21 @@ class Recorder:
         self._last_move_t = now
 
     def _record(self, kind: str, x: int, y: int, injected: bool, **extra) -> None:
-        """所有回调的统一入口：过滤 -> 抽稀 -> 落盘计数。"""
+        """所有回调的统一入口。**这里绝不允许抛异常。**
+
+        回调里一旦抛出去，pynput 会捕获它并停掉整个监听器，而异常本身又被
+        钩子过程里的裸 except 吞掉——表现就是录制无声中断，调用方毫无察觉。
+        所以全部兜住，只把错误记下来交给界面显示。
+        """
+        try:
+            self._record_action(kind, x, y, injected, **extra)
+        except Exception as exc:  # noqa: BLE001 - 就是要兜住一切
+            with self._lock:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                self.error_count += 1
+
+    def _record_action(self, kind: str, x: int, y: int, injected: bool, **extra) -> None:
+        """真正干活的地方：过滤 -> 抽稀 -> 落盘计数。"""
         now = time.perf_counter()
         x, y = int(x), int(y)
         with self._lock:

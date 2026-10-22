@@ -16,6 +16,7 @@ import time
 
 import macro_model
 import player as player_mod
+import recorder as recorder_mod
 from macro_model import (
     KIND_DOWN,
     KIND_KEYS,
@@ -1404,6 +1405,65 @@ def test_step_dialog() -> None:
     check("对话框测试结束", True)
 
 
+def test_recorder_watchdog_gui() -> None:
+    print("\n[看门狗接线]")
+
+    import tkinter as tk
+
+    import mouse_macro
+
+    class Dummy:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    mouse_macro.keyboard.GlobalHotKeys = Dummy
+
+    root = tk.Tk()
+    root.withdraw()
+    mouse_macro._apply_scaling(root)
+    app = mouse_macro.MacroApp(root)
+
+    def settle(times: int = 30) -> None:
+        for _ in range(times):
+            root.update()
+            time.sleep(0.02)
+
+    settle()
+    app._record_after = None
+    app._begin_record()
+    settle(5)
+    check("录制中钩子是活的", app.recorder.listener_alive())
+
+    # 模拟钩子意外死亡：绕过 recorder 直接停掉底层监听器。
+    # 这里必须先把状态取下来再看，因为一跑 root.update() 看门狗就会把它重挂好——
+    # 观察窗口只有"停止之后、下一次 tick 之前"这一瞬。
+    app.recorder._listener.stop()
+    killed = not app.recorder.listener_alive()
+    still_active = app.recorder.active
+    check("强杀之后检测为死", killed)
+    check("此时 recorder.active 仍是真（事故现场）", still_active)
+
+    settle(30)
+    check("看门狗把钩子重挂上了", app.recorder.listener_alive())
+    check(
+        "重挂次数被记录",
+        app.recorder.stats()["restarts"] == 1,
+        str(app.recorder.stats()["restarts"]),
+    )
+    check("状态栏给出告警", "中断过" in app.var_status.get(), app.var_status.get())
+    check("统计行给出告警", "重挂" in app.var_capture_info.get(), app.var_capture_info.get())
+
+    app.stop_record()
+    check("收尾总结里也说明了", "中断过" in app.var_status.get(), app.var_status.get())
+    app._on_close()
+
+
 def test_startup_logging() -> None:
     print("\n[启动日志]")
 
@@ -1515,6 +1575,71 @@ def run_player(actions, **kwargs):
         p.stop()
         done.wait(3)
     return p, result
+
+
+def test_recorder_never_raises() -> None:
+    """采集回调绝不能抛异常，否则 pynput 会静默停掉整个监听器。
+
+    实测过：回调里抛一次，listener.running 立刻变 False，之后注入再多事件
+    也一个都收不到，而调用方察觉不到任何异常。
+    """
+    print("\n[回调兜底]")
+
+    real_action = recorder_mod.Action
+    thrown: list = []
+
+    class Boom:
+        def __init__(self, *args, **kwargs):
+            thrown.append(1)
+            raise RuntimeError("测试用异常")
+
+    recorder_mod.Action = Boom
+    try:
+        rec = make_active_recorder()
+        raised = False
+        try:
+            rec._on_move(10, 10, False)
+            rec._on_click(10, 10, player_mod.Button.left, True, False)
+            rec._on_scroll(10, 10, 0, 1, False)
+        except Exception:
+            raised = True
+    finally:
+        recorder_mod.Action = real_action
+
+    check("回调里的异常不会抛出去", not raised)
+    check("三次回调都被兜住", len(thrown) == 3, str(len(thrown)))
+    stats = rec.stats()
+    check("异常被计入 errors", stats["errors"] == 3, str(stats["errors"]))
+    check("异常信息被记下来", "测试用异常" in stats["last_error"], stats["last_error"])
+    check("出错不影响已记录的动作数", stats["recorded"] == 0, str(stats["recorded"]))
+
+    # 兜底之后紧接着的正常调用要照常工作
+    rec._on_move(50, 60, False)
+    check("兜底之后仍能正常记录", rec.stats()["recorded"] == 1, str(rec.stats()["recorded"]))
+
+
+def test_listener_watchdog_api() -> None:
+    print("\n[看门狗 API]")
+
+    rec = Recorder()
+    check("没在录制时 listener_alive 恒为真", rec.listener_alive())
+    check("没在录制时不允许重挂", not rec.restart_listener())
+
+    fresh = Recorder().stats()
+    for key in ("errors", "restarts", "last_error"):
+        check(f"stats 里有 {key}", key in fresh, str(list(fresh)))
+
+    # _active 为真但没有监听器时，应当判定为"死了"
+    zombie = make_active_recorder()
+    check("没有监听器时报死", not zombie.listener_alive())
+
+    # 真的重挂一个（这一步会挂真实的系统钩子，很快就停掉）
+    ok = zombie.restart_listener()
+    check("能重挂监听器", ok)
+    check("重挂后判定为活的", zombie.listener_alive())
+    check("restarts 计数增加", zombie.stats()["restarts"] == 1, str(zombie.stats()["restarts"]))
+    zombie.stop()
+    check("停掉之后不再判定为活", zombie.listener_alive())
 
 
 def test_player() -> None:
@@ -1701,12 +1826,15 @@ def main() -> int:
     test_keyinput()
     test_recorder()
     test_recorder_stats()
+    test_recorder_never_raises()
+    test_listener_watchdog_api()
     test_player()
     test_gui()
     test_hotkeys()
     test_editing()
     test_script_tab()
     test_step_dialog()
+    test_recorder_watchdog_gui()
     test_startup_logging()
     test_main_entry()
 
