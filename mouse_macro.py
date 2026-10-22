@@ -1,8 +1,13 @@
-"""鼠标宏：录制屏幕上的鼠标动作，再按设定次数重复回放。
+"""键鼠自动化：录制鼠标动作回放，或用剧本在屏幕上取点逐步执行。
+
+两条路共用同一套回放引擎：
+
+* 录制 —— 全局钩子采集鼠标移动、点击、滚轮，按原始时间轴重放；
+* 剧本 —— 手写步骤，一步步指定坐标 + 鼠标动作，或者输入文字 / 按快捷键。
 
     python mouse_macro.py
 
-热键：F9 开始/停止录制，F10 回放，F11 停止。
+热键：F9 录制，F10 回放，F11 停止，F8 取点。
 """
 
 from __future__ import annotations
@@ -163,7 +168,7 @@ class MacroApp:
 
     def _build_ui(self) -> None:
         root = self.root
-        root.title("鼠标宏 · 录制 / 回放")
+        root.title("键鼠自动化 · 录制 / 剧本")
         root.geometry("1060x690")
         root.minsize(1020, 650)
 
@@ -1100,18 +1105,18 @@ class MacroApp:
 
         path = filedialog.asksaveasfilename(
             parent=self.root,
-            title="保存剧本" if on_script else "保存鼠标宏",
+            title="保存剧本" if on_script else "保存录制",
             defaultextension=".json",
             initialdir=self._macro_dir(),
             initialfile="script.json" if on_script else "macro.json",
-            filetypes=[("鼠标宏 / 剧本", "*.json"), ("所有文件", "*.*")],
+            filetypes=[("键鼠自动化 / 剧本", "*.json"), ("所有文件", "*.*")],
         )
         if not path:
             return
 
         meta = {
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "tool": "mouse_macro",
+            "tool": "keymouse_automation",
         }
         try:
             if on_script:
@@ -1133,9 +1138,9 @@ class MacroApp:
             return
         path = filedialog.askopenfilename(
             parent=self.root,
-            title="加载鼠标宏 / 剧本",
+            title="加载录制 / 剧本",
             initialdir=self._macro_dir(),
-            filetypes=[("鼠标宏 / 剧本", "*.json"), ("所有文件", "*.*")],
+            filetypes=[("键鼠自动化 / 剧本", "*.json"), ("所有文件", "*.*")],
         )
         if not path:
             return

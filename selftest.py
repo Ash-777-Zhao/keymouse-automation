@@ -1694,7 +1694,7 @@ def test_gui() -> None:
 
 
 def main() -> int:
-    print("鼠标宏自检")
+    print("键鼠自动化自检")
     test_model()
     test_remove_actions()
     test_script_model()
