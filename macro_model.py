@@ -16,8 +16,17 @@ KIND_MOVE = "move"
 KIND_DOWN = "down"
 KIND_UP = "up"
 KIND_SCROLL = "scroll"
+KIND_TYPE = "type"  # 键盘输入一段文字，由剧本步骤展开而来
 
-VALID_KINDS = (KIND_MOVE, KIND_DOWN, KIND_UP, KIND_SCROLL)
+VALID_KINDS = (KIND_MOVE, KIND_DOWN, KIND_UP, KIND_SCROLL, KIND_TYPE)
+
+# 文件里区分两种内容：录制出来的一串动作，还是手写的剧本步骤
+KIND_RECORDING = "recording"
+KIND_SCRIPT = "script"
+
+# 键盘逐字输入时每个字符占用的毫秒数。
+# 剧本展开时间轴和实际回放都要用同一个值，否则两者会对不上，所以放在这里共用。
+TYPE_CHAR_MS = 25
 VALID_BUTTONS = ("left", "right", "middle", "x1", "x2")
 
 _BUTTON_CN = {"left": "左键", "right": "右键", "middle": "中键", "x1": "侧键1", "x2": "侧键2"}
@@ -36,11 +45,15 @@ class Action:
     button: str = ""
     dx: int = 0
     dy: int = 0
+    text: str = ""  # 仅 KIND_TYPE 用
 
     def label(self) -> str:
         """列表里显示的中文动作名。"""
         if self.kind == KIND_MOVE:
             return "移动"
+        if self.kind == KIND_TYPE:
+            shown = self.text if len(self.text) <= 12 else self.text[:12] + "…"
+            return f"输入 {shown}"
         if self.kind == KIND_DOWN:
             return f"{_BUTTON_CN.get(self.button, self.button)}按下"
         if self.kind == KIND_UP:
@@ -85,10 +98,12 @@ def _action_to_dict(a: Action) -> dict[str, Any]:
     if a.kind == KIND_SCROLL:
         d["dx"] = a.dx
         d["dy"] = a.dy
+    if a.kind == KIND_TYPE:
+        d["text"] = a.text
     return d
 
 
-def _clamp_int(value: Any, low: int, high: int, default: int = 0) -> int:
+def clamp_int(value: Any, low: int, high: int, default: int = 0) -> int:
     try:
         return max(low, min(high, int(value)))
     except (TypeError, ValueError):
@@ -113,42 +128,57 @@ def _parse_action(raw: Any, index: int) -> Action:
 
     return Action(
         kind=kind,
-        x=_clamp_int(raw.get("x"), -32768, 32767),
-        y=_clamp_int(raw.get("y"), -32768, 32767),
+        x=clamp_int(raw.get("x"), -32768, 32767),
+        y=clamp_int(raw.get("y"), -32768, 32767),
         t=t,
         button=button,
-        dx=_clamp_int(raw.get("dx"), -1000, 1000),
-        dy=_clamp_int(raw.get("dy"), -1000, 1000),
+        dx=clamp_int(raw.get("dx"), -1000, 1000),
+        dy=clamp_int(raw.get("dy"), -1000, 1000),
+        text=str(raw.get("text") or "")[:2000] if kind == KIND_TYPE else "",
     )
 
 
-def save_macro(path: str, actions: Iterable[Action], meta: dict[str, Any] | None = None) -> None:
-    """写宏文件。先写临时文件再替换，避免中途失败留下半个文件。"""
-    payload = {
-        "schema": SCHEMA_VERSION,
-        "meta": meta or {},
-        "actions": [_action_to_dict(a) for a in actions],
-    }
+def write_payload(path: str, payload: dict[str, Any]) -> None:
+    """先写临时文件再替换，避免中途失败留下半个文件。"""
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=1)
     os.replace(tmp, path)
 
 
-def load_macro(path: str) -> tuple[list[Action], dict[str, Any]]:
-    """读宏文件，返回 (动作列表, meta)。坏数据会被跳过或抛 MacroFormatError。"""
+def read_payload(path: str) -> dict[str, Any]:
+    """读文件并确认根节点是对象。JSON 语法错误会抛 ValueError。"""
     with open(path, "r", encoding="utf-8") as fh:
         payload = json.load(fh)
-
     if not isinstance(payload, dict):
         raise MacroFormatError("文件根节点不是 JSON 对象。")
+    return payload
 
-    raw_actions = payload.get("actions")
+
+def parse_actions(raw_actions: Any) -> list[Action]:
     if not isinstance(raw_actions, list):
         raise MacroFormatError("文件里没有 actions 列表。")
-
     actions = [_parse_action(raw, i) for i, raw in enumerate(raw_actions)]
     actions.sort(key=lambda a: a.t)
+    return actions
 
+
+def save_macro(path: str, actions: Iterable[Action], meta: dict[str, Any] | None = None) -> None:
+    """保存录制得到的动作列表。"""
+    write_payload(
+        path,
+        {
+            "schema": SCHEMA_VERSION,
+            "kind": KIND_RECORDING,
+            "meta": meta or {},
+            "actions": [_action_to_dict(a) for a in actions],
+        },
+    )
+
+
+def load_macro(path: str) -> tuple[list[Action], dict[str, Any]]:
+    """读录制文件，返回 (动作列表, meta)。坏数据会抛 MacroFormatError。"""
+    payload = read_payload(path)
+    actions = parse_actions(payload.get("actions"))
     meta = payload.get("meta")
     return actions, meta if isinstance(meta, dict) else {}

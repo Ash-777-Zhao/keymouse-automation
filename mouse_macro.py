@@ -23,9 +23,9 @@ MAX_ROWS = 3000  # 列表最多渲染这么多行，再多只是拖慢界面
 SETTINGS_FILE = "settings.json"
 
 # pynput 的热键写法：'<f9>' 表示 F9，单个字符直接写 'a'
-DEFAULT_HOTKEYS = {"record": "<f9>", "play": "<f10>", "stop": "<f11>"}
-HOTKEY_ORDER = ("record", "play", "stop")
-HOTKEY_NAMES = {"record": "录制", "play": "回放", "stop": "停止"}
+DEFAULT_HOTKEYS = {"record": "<f9>", "play": "<f10>", "stop": "<f11>", "pick": "<f8>"}
+HOTKEY_ORDER = ("record", "play", "stop", "pick")
+HOTKEY_NAMES = {"record": "录制", "play": "回放", "stop": "停止", "pick": "取点"}
 
 
 def _pretty_hotkey(spec: str) -> str:
@@ -72,9 +72,25 @@ _enable_dpi_awareness()
 try:
     from pynput import keyboard
 
-    from macro_model import MacroFormatError, load_macro, remove_actions, save_macro
+    from macro_model import (
+        KIND_SCRIPT,
+        MacroFormatError,
+        remove_actions,
+        save_macro,
+    )
     from player import Player
     from recorder import Recorder
+    from screen_picker import PointPicker, cursor_position
+    from script_model import (
+        DEFAULT_DELAY_MS,
+        MOUSE_LEFT,
+        Step,
+        load_any,
+        remove_steps,
+        save_script,
+        steps_to_actions,
+    )
+    from step_dialog import StepDialog
 except ImportError as exc:  # pragma: no cover - 只在不满足依赖时走到
     import tkinter.messagebox as _mb
 
@@ -103,7 +119,9 @@ class MacroApp:
         self.recorder = Recorder()
         self.player = Player()
         self.actions: list = []
+        self.steps: list[Step] = []
         self.macro_path: str | None = None
+        self._picker: PointPicker | None = None
 
         self._ui_queue: queue.Queue = queue.Queue()
         self._hotkeys = None
@@ -122,13 +140,16 @@ class MacroApp:
         self.var_speed = tk.DoubleVar(value=1.0)
         self.var_gap = tk.IntVar(value=500)
         self.var_moves = tk.BooleanVar(value=True)
+        self.var_native_typing = tk.BooleanVar(value=False)
         # 默认关掉窗口过滤：开启时它会静默吞掉落在本窗口范围内的动作，
-# 万一目标区域和窗口重叠就会表现得像“录不到”，不容易察觉。需要时手动勾。
+        # 万一目标区域和窗口重叠就会表现得像"录不到"，不容易察觉。需要时手动勾。
         self.var_skip_self = tk.BooleanVar(value=False)
         self.var_skip_injected = tk.BooleanVar(value=True)
         self.var_status = tk.StringVar(value="就绪。按 F9 开始录制。")
         self.var_capture_info = tk.StringVar(value="")
         self.var_selection = tk.StringVar(value="")
+        self.var_step_count = tk.StringVar(value="共 0 步")
+        self.var_step_selection = tk.StringVar(value="")
 
         self._build_ui()
         error = self._install_hotkeys()
@@ -142,8 +163,8 @@ class MacroApp:
     def _build_ui(self) -> None:
         root = self.root
         root.title("鼠标宏 · 录制 / 回放")
-        root.geometry("960x620")
-        root.minsize(920, 600)
+        root.geometry("1060x690")
+        root.minsize(1020, 650)
 
         toolbar = ttk.Frame(root, padding=(10, 10, 10, 4))
         toolbar.pack(fill="x")
@@ -165,8 +186,16 @@ class MacroApp:
         body = ttk.Frame(root, padding=(10, 4, 10, 4))
         body.pack(fill="both", expand=True)
 
-        left = ttk.Frame(body)
-        left.pack(side="left", fill="both", expand=True)
+        self.notebook = ttk.Notebook(body)
+        self.notebook.pack(side="left", fill="both", expand=True)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+        record_tab = ttk.Frame(self.notebook, padding=(0, 6, 0, 0))
+        self.notebook.add(record_tab, text="  录制  ")
+        script_tab = ttk.Frame(self.notebook, padding=(0, 6, 0, 0))
+        self.notebook.add(script_tab, text="  剧本  ")
+
+        left = record_tab
 
         list_bar = ttk.Frame(left)
         list_bar.pack(fill="x", pady=(0, 4))
@@ -210,6 +239,7 @@ class MacroApp:
         self.tree.bind("<Control-a>", self._on_select_all_key)
         self.tree.bind("<<TreeviewSelect>>", self._on_selection_change)
 
+        self._build_script_tab(script_tab)
         self._build_settings(body)
 
         statusbar = ttk.Frame(root, padding=(10, 2, 10, 10))
@@ -226,6 +256,240 @@ class MacroApp:
         ttk.Label(
             statusbar, textvariable=self.var_capture_info, foreground="#666666"
         ).pack(side="left", pady=(2, 0))
+
+    def _build_script_tab(self, parent: ttk.Frame) -> None:
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", pady=(0, 4))
+        self._step_bar = bar
+        ttk.Button(bar, text="屏幕上取点添加", width=15, command=self.pick_point_for_step).pack(
+            side="left"
+        )
+        ttk.Button(bar, text="手动添加", width=10, command=self.add_step).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(bar, text="编辑", width=7, command=self.edit_step).pack(
+            side="left", padx=(6, 0)
+        )
+        self.btn_step_delete = ttk.Button(
+            bar, text="删除", width=7, command=self.delete_steps
+        )
+        self.btn_step_delete.pack(side="left", padx=(6, 0))
+        self.btn_step_up = ttk.Button(
+            bar, text="↑", width=3, command=lambda: self.move_step(-1)
+        )
+        self.btn_step_up.pack(side="left", padx=(6, 0))
+        self.btn_step_down = ttk.Button(
+            bar, text="↓", width=3, command=lambda: self.move_step(1)
+        )
+        self.btn_step_down.pack(side="left", padx=(2, 0))
+        ttk.Button(bar, text="清空", width=7, command=self.clear_steps).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Label(bar, textvariable=self.var_step_selection, foreground="#666666").pack(
+            side="left", padx=(10, 0)
+        )
+        ttk.Label(bar, textvariable=self.var_step_count, foreground="#666666").pack(side="right")
+
+        area = ttk.Frame(parent)
+        area.pack(fill="both", expand=True)
+
+        columns = ("idx", "pos", "mouse", "text", "delay")
+        self.step_tree = ttk.Treeview(
+            area, columns=columns, show="headings", selectmode="extended"
+        )
+        self.step_tree.heading("idx", text="#")
+        self.step_tree.heading("pos", text="坐标")
+        self.step_tree.heading("mouse", text="鼠标动作")
+        self.step_tree.heading("text", text="输入文字")
+        self.step_tree.heading("delay", text="执行后等待")
+        self.step_tree.column("idx", width=44, anchor="e", stretch=False)
+        self.step_tree.column("pos", width=130, anchor="w", stretch=False)
+        self.step_tree.column("mouse", width=90, anchor="w", stretch=False)
+        self.step_tree.column("text", width=140, anchor="w")
+        self.step_tree.column("delay", width=90, anchor="e", stretch=False)
+
+        scrollbar = ttk.Scrollbar(area, orient="vertical", command=self.step_tree.yview)
+        self.step_tree.configure(yscrollcommand=scrollbar.set)
+        self.step_tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.step_tree.bind("<Double-1>", lambda _e: self.edit_step())
+        self.step_tree.bind("<Delete>", self._on_step_delete_key)
+        self.step_tree.bind("<Control-a>", self._on_step_select_all_key)
+        self.step_tree.bind("<<TreeviewSelect>>", self._on_step_selection_change)
+
+    # ------------------------------------------------------------------ 剧本
+
+    def _on_tab_changed(self, _event=None) -> None:
+        """切页签时把按钮和提示文字换成当前这套的。"""
+        self._refresh_hotkey_labels()
+        if not self.recorder.active:
+            self._render_actions(announce=False)
+            self._render_steps()
+            if self._on_script_tab():
+                total = sum(step.delay_ms for step in self.steps)
+                hint = "，点「屏幕上取点添加」开始" if not self.steps else f"，预计耗时约 {total / 1000:.1f} 秒"
+                self.var_status.set(f"剧本共 {len(self.steps)} 步{hint}。")
+            else:
+                self.var_status.set(f"录制模式，当前有 {len(self.actions)} 个动作。")
+
+    def _on_script_tab(self) -> bool:
+        try:
+            return self.notebook.index(self.notebook.select()) == 1
+        except tk.TclError:
+            return False
+
+    def _select_script_tab(self) -> None:
+        self._select_tab(1)
+
+    def _busy(self) -> bool:
+        return self.recorder.active or self.player.running or self._record_after is not None
+
+    def _render_steps(self) -> None:
+        self.step_tree.delete(*self.step_tree.get_children())
+        self._on_step_selection_change()
+        for index, step in enumerate(self.steps[:MAX_ROWS]):
+            shown = step.text if len(step.text) <= 20 else step.text[:20] + "…"
+            self.step_tree.insert(
+                "",
+                "end",
+                values=(
+                    index + 1,
+                    f"{step.x}, {step.y}",
+                    step.mouse_label(),
+                    shown or "—",
+                    f"{step.delay_ms} ms",
+                ),
+            )
+        self.var_step_count.set(f"共 {len(self.steps)} 步")
+
+    def _on_step_selection_change(self, _event=None) -> None:
+        count = len(self.step_tree.selection())
+        self.var_step_selection.set("" if count == 0 else f"已选 {count} 步")
+
+    def _on_step_delete_key(self, _event=None) -> str:
+        self.delete_steps()
+        return "break"
+
+    def _on_step_select_all_key(self, _event=None) -> str:
+        self.select_all_steps()
+        return "break"
+
+    def _selected_step_indices(self) -> list[int]:
+        return sorted(self.step_tree.index(item) for item in self.step_tree.selection())
+
+    def _edit_step_dialog(self, step: Step, index: int | None = None) -> Step | None:
+        dialog = StepDialog(self.root, step, index)
+        self.root.wait_window(dialog)
+        return dialog.result
+
+    def _add_step_at(self, x: int, y: int) -> None:
+        """取点回调：拿到坐标后立刻弹对话框设动作和输入。"""
+        self._picker = None
+        result = self._edit_step_dialog(Step(x=x, y=y, mouse=MOUSE_LEFT, delay_ms=DEFAULT_DELAY_MS))
+        if result is None:
+            self.var_status.set(f"已取到 ({x}, {y})，但没有添加。")
+            return
+        self.steps.append(result)
+        self._render_steps()
+        self._select_script_tab()
+        self.var_status.set(f"已添加第 {len(self.steps)} 步：{result.summary()}")
+
+    def _on_pick_cancelled(self) -> None:
+        self._picker = None
+        self.var_status.set("已取消取点。")
+
+    def pick_point_for_step(self) -> None:
+        if self._busy():
+            self._warn("正在录制或回放，先停下来再取点。")
+            return
+        if self._picker is not None:
+            return
+        self.var_status.set("把鼠标移到目标位置，点击选取坐标（Esc 取消）。")
+        self._picker = PointPicker(
+            self.root, on_picked=self._add_step_at, on_cancel=self._on_pick_cancelled
+        )
+
+    def quick_pick_step(self) -> None:
+        """热键取点：直接取当前鼠标位置，按默认设置添加一步，不弹对话框。"""
+        if self._busy():
+            self._warn("正在录制或回放，先停下来再取点。")
+            return
+        x, y = cursor_position()
+        self.steps.append(Step(x=x, y=y, mouse=MOUSE_LEFT, delay_ms=DEFAULT_DELAY_MS))
+        self._render_steps()
+        self._select_script_tab()
+        self.var_status.set(f"已按当前位置添加第 {len(self.steps)} 步：(x, y)=({x}, {y})")
+
+    def add_step(self) -> None:
+        if self._busy():
+            return
+        result = self._edit_step_dialog(Step(mouse=MOUSE_LEFT, delay_ms=DEFAULT_DELAY_MS))
+        if result is None:
+            return
+        self.steps.append(result)
+        self._render_steps()
+        self.var_status.set(f"已添加第 {len(self.steps)} 步：{result.summary()}")
+
+    def edit_step(self) -> None:
+        if self._busy():
+            return
+        indices = self._selected_step_indices()
+        if len(indices) != 1:
+            self._warn("选中一个步骤再点编辑。")
+            return
+        index = indices[0]
+        result = self._edit_step_dialog(self.steps[index], index)
+        if result is None:
+            return
+        self.steps[index] = result
+        self._render_steps()
+        self.step_tree.selection_set(self.step_tree.get_children()[index])
+        self.var_status.set(f"第 {index + 1} 步已更新：{result.summary()}")
+
+    def delete_steps(self) -> None:
+        if self._busy():
+            return
+        indices = self._selected_step_indices()
+        if not indices:
+            self._warn("先在列表里选中要删除的步骤（Delete 键也可以）。")
+            return
+        removed = len(indices)
+        self.steps = remove_steps(self.steps, indices)
+        self._render_steps()
+        self.var_status.set(f"已删除 {removed} 个步骤，剩下 {len(self.steps)} 步。")
+
+    def select_all_steps(self) -> None:
+        if self._busy():
+            return
+        items = self.step_tree.get_children()
+        if items:
+            self.step_tree.selection_set(items)
+            self._on_step_selection_change()
+
+    def move_step(self, delta: int) -> None:
+        if self._busy():
+            return
+        indices = self._selected_step_indices()
+        if len(indices) != 1:
+            self._warn("选中一个步骤再用 ↑ ↓ 调整顺序。")
+            return
+        index = indices[0]
+        target = index + delta
+        if not 0 <= target < len(self.steps):
+            return
+        self.steps[index], self.steps[target] = self.steps[target], self.steps[index]
+        self._render_steps()
+        self.step_tree.selection_set(self.step_tree.get_children()[target])
+
+    def clear_steps(self) -> None:
+        if self._busy():
+            return
+        if not self.steps:
+            return
+        self.steps = []
+        self._render_steps()
+        self.var_status.set("剧本已清空。")
 
     def _build_settings(self, parent: ttk.Frame) -> None:
         column = ttk.Frame(parent, width=300)
@@ -271,6 +535,11 @@ class MacroApp:
         ttk.Checkbutton(panel, text="还原移动轨迹", variable=self.var_moves).grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(0, 4)
         )
+        row += 1
+
+        ttk.Checkbutton(
+            panel, text="用模拟按键方式输入", variable=self.var_native_typing
+        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
         row += 1
 
         ttk.Separator(panel, orient="horizontal").grid(
@@ -418,6 +687,7 @@ class MacroApp:
                     self.hotkeys["record"]: lambda: self._post(self.toggle_record),
                     self.hotkeys["play"]: lambda: self._post(self.start_play),
                     self.hotkeys["stop"]: lambda: self._post(self.stop_all),
+                    self.hotkeys["pick"]: lambda: self._post(self.quick_pick_step),
                 }
             )
             self._hotkeys.start()
@@ -599,11 +869,12 @@ class MacroApp:
         self._play(0)
 
     def play_from_selection(self) -> None:
-        selection = self.tree.selection()
+        tree = self.step_tree if self._on_script_tab() else self.tree
+        selection = tree.selection()
         if not selection:
-            self._warn("先在列表里选中一个动作，作为回放的起点。")
+            self._warn("先在列表里选中一项，作为回放的起点。")
             return
-        self._play(min(self.tree.index(item) for item in selection))
+        self._play(min(tree.index(item) for item in selection))
 
     def _play(self, start: int) -> None:
         if self.recorder.active or self._record_after is not None:
@@ -611,13 +882,23 @@ class MacroApp:
             return
         if self.player.running:
             return
-        if not self.actions:
-            self._warn("还没有录制任何动作。")
-            return
 
-        steps = self.actions[start:]
-        if not steps:
-            self._warn("起点之后已经没有动作了。")
+        # 当前在哪个页签就回放哪一套内容
+        if self._on_script_tab():
+            if not self.steps:
+                self._warn("剧本还是空的，先添加步骤。")
+                return
+            source = steps_to_actions(self.steps[start:])
+            unit = "步"
+        else:
+            if not self.actions:
+                self._warn("还没有录制任何动作。")
+                return
+            source = self.actions[start:]
+            unit = "个动作"
+
+        if not source:
+            self._warn("起点之后已经没有内容了。")
             return
 
         settings = self._read_settings()
@@ -628,14 +909,15 @@ class MacroApp:
         self.progress.configure(value=0)
         self._set_playing_ui(True)
         if start:
-            self.var_status.set(f"从第 {start + 1} 个动作开始回放……")
+            self.var_status.set(f"从第 {start + 1} {unit}开始回放……")
         try:
             self.player.start(
-                steps,
+                source,
                 repeat=settings["repeat"],
                 speed=settings["speed"],
                 gap_ms=settings["gap_ms"],
                 use_moves=settings["use_moves"],
+                native_typing=settings["native_typing"],
                 on_progress=lambda *a: self._post(self._update_progress, *a),
                 on_done=lambda *a: self._post(self._on_play_done, *a),
             )
@@ -678,6 +960,7 @@ class MacroApp:
             "speed": speed,
             "gap_ms": gap_ms,
             "use_moves": bool(self.var_moves.get()),
+            "native_typing": bool(self.var_native_typing.get()),
         }
 
     def _update_progress(self, iteration: int, repeat: int, index: int, total: int) -> None:
@@ -711,6 +994,9 @@ class MacroApp:
             self.btn_save,
             self.btn_delete,
             self.btn_play_sel,
+            self.btn_step_delete,
+            self.btn_step_up,
+            self.btn_step_down,
             *self._hotkey_buttons.values(),
         ]
         for button in buttons:
@@ -728,7 +1014,7 @@ class MacroApp:
 
     # ------------------------------------------------------------------ 列表
 
-    def _render_actions(self) -> None:
+    def _render_actions(self, announce: bool = True) -> None:
         self.tree.delete(*self.tree.get_children())
         self._on_selection_change()
         shown = self.actions[:MAX_ROWS]
@@ -739,7 +1025,7 @@ class MacroApp:
             self.tree.insert(
                 "", "end", values=(index + 1, action.label(), f"{action.x}, {action.y}", gap)
             )
-        if not self.recorder.active:
+        if announce and not self.recorder.active:
             text = f"共 {len(self.actions)} 个动作"
             if len(self.actions) > MAX_ROWS:
                 text += f"（列表只显示前 {MAX_ROWS} 条）"
@@ -803,52 +1089,80 @@ class MacroApp:
         return path
 
     def save_macro(self) -> None:
-        if not self.actions:
+        """保存当前页签的内容：录制页存动作，剧本页存步骤。"""
+        on_script = self._on_script_tab()
+        if on_script and not self.steps:
+            self._warn("剧本还是空的，没有可保存的内容。")
+            return
+        if not on_script and not self.actions:
             self._warn("没有可保存的动作。")
             return
+
         path = filedialog.asksaveasfilename(
             parent=self.root,
-            title="保存鼠标宏",
+            title="保存剧本" if on_script else "保存鼠标宏",
             defaultextension=".json",
             initialdir=self._macro_dir(),
-            initialfile="macro.json",
-            filetypes=[("鼠标宏", "*.json"), ("所有文件", "*.*")],
+            initialfile="script.json" if on_script else "macro.json",
+            filetypes=[("鼠标宏 / 剧本", "*.json"), ("所有文件", "*.*")],
         )
         if not path:
             return
+
         meta = {
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "actions": len(self.actions),
             "tool": "mouse_macro",
         }
         try:
-            save_macro(path, self.actions, meta)
+            if on_script:
+                meta["steps"] = len(self.steps)
+                save_script(path, self.steps, meta)
+            else:
+                meta["actions"] = len(self.actions)
+                save_macro(path, self.actions, meta)
         except OSError as exc:
             messagebox.showerror("保存失败", str(exc), parent=self.root)
             return
+
         self.macro_path = path
-        self.var_status.set(f"已保存 {len(self.actions)} 个动作到 {path}")
+        count = len(self.steps) if on_script else len(self.actions)
+        self.var_status.set(f"已保存 {count} {'步剧本' if on_script else '个动作'}到 {path}")
 
     def load_macro(self) -> None:
         if self.recorder.active or self.player.running:
             return
         path = filedialog.askopenfilename(
             parent=self.root,
-            title="加载鼠标宏",
+            title="加载鼠标宏 / 剧本",
             initialdir=self._macro_dir(),
-            filetypes=[("鼠标宏", "*.json"), ("所有文件", "*.*")],
+            filetypes=[("鼠标宏 / 剧本", "*.json"), ("所有文件", "*.*")],
         )
         if not path:
             return
         try:
-            actions, _meta = load_macro(path)
+            kind, data, _meta = load_any(path)
         except (OSError, MacroFormatError, ValueError) as exc:
             messagebox.showerror("加载失败", str(exc), parent=self.root)
             return
-        self.actions = actions
+
         self.macro_path = path
-        self._render_actions()
-        self.var_status.set(f"已加载 {len(actions)} 个动作：{os.path.basename(path)}")
+        name = os.path.basename(path)
+        if kind == KIND_SCRIPT:
+            self.steps = data
+            self._render_steps()
+            self._select_tab(1)
+            self.var_status.set(f"已加载剧本 {len(data)} 步：{name}")
+        else:
+            self.actions = data
+            self._render_actions()
+            self._select_tab(0)
+            self.var_status.set(f"已加载 {len(data)} 个动作：{name}")
+
+    def _select_tab(self, index: int) -> None:
+        try:
+            self.notebook.select(index)
+        except tk.TclError:
+            pass
 
     # ------------------------------------------------------------------ 杂项
 

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 import tempfile
@@ -15,7 +16,16 @@ import time
 
 import macro_model
 import player as player_mod
-from macro_model import KIND_DOWN, KIND_MOVE, KIND_SCROLL, KIND_UP, Action
+from macro_model import (
+    KIND_DOWN,
+    KIND_MOVE,
+    KIND_RECORDING,
+    KIND_SCROLL,
+    KIND_SCRIPT,
+    KIND_TYPE,
+    KIND_UP,
+    Action,
+)
 from recorder import Recorder
 
 PASSED = 0
@@ -215,6 +225,198 @@ def test_remove_actions() -> None:
     check("删除后滚轮数值保持不变", (kept[1].dx, kept[1].dy) == (1, -2), str((kept[1].dx, kept[1].dy)))
 
 
+# ------------------------------------------------------------------ 剧本模型
+
+
+def test_script_model() -> None:
+    print("\n[剧本模型]")
+
+    import script_model as sm
+
+    acts = sm.steps_to_actions([sm.Step(x=100, y=200, mouse=sm.MOUSE_LEFT, delay_ms=500)])
+    check(
+        "左键单击展开成 移动+按下+抬起",
+        [a.kind for a in acts] == [KIND_MOVE, KIND_DOWN, KIND_UP],
+        str([a.kind for a in acts]),
+    )
+    check("展开后每个动作都带同一坐标", all((a.x, a.y) == (100, 200) for a in acts))
+    check("展开后按键是左键", acts[1].button == "left", acts[1].button)
+
+    acts = sm.steps_to_actions([sm.Step(x=1, y=2, mouse=sm.MOUSE_NONE, delay_ms=0)])
+    check("仅移动只展开出一个动作", [a.kind for a in acts] == [KIND_MOVE], str([a.kind for a in acts]))
+
+    acts = sm.steps_to_actions([sm.Step(mouse=sm.MOUSE_DOUBLE, delay_ms=0)])
+    check(
+        "双击展开成 移动+两次按下抬起",
+        [a.kind for a in acts] == [KIND_MOVE, KIND_DOWN, KIND_UP, KIND_DOWN, KIND_UP],
+        str([a.kind for a in acts]),
+    )
+    downs = [a.t for a in acts if a.kind == KIND_DOWN]
+    check(
+        "双击两下之间有间隔",
+        downs[1] - downs[0] == sm.CLICK_HOLD_MS + sm.DOUBLE_CLICK_GAP_MS,
+        str(downs),
+    )
+
+    for name, mouse, positive in (("滚轮上", sm.MOUSE_WHEEL_UP, True), ("滚轮下", sm.MOUSE_WHEEL_DOWN, False)):
+        acts = sm.steps_to_actions([sm.Step(mouse=mouse, delay_ms=0)])
+        scroll = [a for a in acts if a.kind == KIND_SCROLL]
+        check(f"{name}展开出滚轮动作", len(scroll) == 1, str([a.kind for a in acts]))
+        check(f"{name}方向正确", (scroll[0].dy > 0) == positive, str(scroll[0].dy))
+
+    # 右键 / 中键
+    for name, mouse, button in (("右键", sm.MOUSE_RIGHT, "right"), ("中键", sm.MOUSE_MIDDLE, "middle")):
+        acts = sm.steps_to_actions([sm.Step(mouse=mouse, delay_ms=0)])
+        check(f"{name}展开后按键正确", acts[1].button == button, acts[1].button)
+
+    acts = sm.steps_to_actions([sm.Step(mouse=sm.MOUSE_LEFT, text="admin", delay_ms=300)])
+    check("输入文字展开成 type 动作", acts[-1].kind == KIND_TYPE, str([a.kind for a in acts]))
+    check("输入内容完整保留", acts[-1].text == "admin", acts[-1].text)
+    check("输入动作带坐标", (acts[-1].x, acts[-1].y) == (0, 0))
+
+    # 输入本身要占时间，否则后面那步会在打字中途就触发
+    steps = [
+        sm.Step(x=0, y=0, mouse=sm.MOUSE_NONE, text="abcd", delay_ms=1000),
+        sm.Step(x=9, y=9, mouse=sm.MOUSE_NONE, delay_ms=0),
+    ]
+    acts = sm.steps_to_actions(steps)
+    second_move = [a for a in acts if a.kind == KIND_MOVE][1]
+    check(
+        "打字耗时被计入时间轴",
+        second_move.t == 4 * macro_model.TYPE_CHAR_MS + 1000,
+        str(second_move.t),
+    )
+
+    check("空剧本展开为空列表", sm.steps_to_actions([]) == [])
+
+    steps = [sm.Step(x=i, delay_ms=0) for i in range(5)]
+    kept = sm.remove_steps(steps, [1, 3])
+    check("删除步骤", [s.x for s in kept] == [0, 2, 4], str([s.x for s in kept]))
+    check("删除步骤不影响延时字段", all(s.delay_ms == 0 for s in kept))
+
+    # 存取
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "s.json")
+        original = [
+            sm.Step(x=-1500, y=300, mouse=sm.MOUSE_DOUBLE, text="中文abc", delay_ms=1200),
+            sm.Step(x=800, y=600, mouse=sm.MOUSE_WHEEL_UP, delay_ms=0),
+        ]
+        sm.save_script(path, original, {"note": "测试"})
+        loaded, meta = sm.load_script(path)
+        check("剧本存取往返一致", loaded == original, str(loaded))
+        check("剧本 meta 保留", meta.get("note") == "测试", str(meta))
+        check("副屏负坐标能存能读", loaded[0].x == -1500, str(loaded[0].x))
+
+        kind, data, _ = sm.load_any(path)
+        check("load_any 认出剧本", kind == KIND_SCRIPT, kind)
+        check("load_any 取出步骤", data == original)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "m.json")
+        macro_model.save_macro(path, [Action(KIND_MOVE, 1, 1, 0.0)])
+        kind, data, _ = sm.load_any(path)
+        check("load_any 认出录制", kind == KIND_RECORDING, kind)
+        check("load_any 取出动作", len(data) == 1 and data[0].kind == KIND_MOVE, str(data))
+
+        # 早期版本的文件没有 kind 字段
+        old = os.path.join(tmp, "old.json")
+        with open(old, "w", encoding="utf-8") as fh:
+            fh.write('{"actions": [{"kind": "move", "x": 5, "y": 6, "t": 0}]}')
+        kind, data, _ = sm.load_any(old)
+        check("老格式没有 kind 也能认出录制", kind == KIND_RECORDING, kind)
+        check("老格式内容正确读入", (data[0].x, data[0].y) == (5, 6), str(data))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "bad.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"kind": "script", "steps": [{"x": "abc", "mouse": "瞎写的", "delay_ms": -5}]}')
+        loaded, _ = sm.load_script(path)
+        check("非法坐标退化为 0", loaded[0].x == 0, str(loaded[0].x))
+        check("非法鼠标动作退化为左键", loaded[0].mouse == sm.MOUSE_LEFT, loaded[0].mouse)
+        check("负延时归零", loaded[0].delay_ms == 0, str(loaded[0].delay_ms))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "empty.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"kind": "script"}')
+        try:
+            sm.load_script(path)
+            check("没有 steps 时应当报错", False, "没有抛异常")
+        except macro_model.MacroFormatError:
+            check("没有 steps 会抛 MacroFormatError", True)
+
+    check("每个鼠标动作都有中文名", all(k in sm.MOUSE_ACTION_CN for k in sm.MOUSE_ACTIONS))
+    check("步骤概要有内容", "左键单击" in sm.Step(x=1, y=2).summary(), sm.Step(x=1, y=2).summary())
+
+
+# ------------------------------------------------------------------ 键盘输入
+
+
+def test_keyinput() -> None:
+    print("\n[键盘输入]")
+
+    import tkinter as tk
+
+    import keyinput
+
+    check(
+        "SendInput 结构体大小和系统一致",
+        keyinput.SENDINPUT_AVAILABLE,
+        f"sizeof(INPUT)={ctypes.sizeof(keyinput._INPUT)}，系统要求 {keyinput._EXPECTED_INPUT_SIZE}",
+    )
+    check("字母可走原生按键路径", keyinput.can_type_natively("a"))
+    check("数字可走原生按键路径", keyinput.can_type_natively("7"))
+    check("符号可走原生按键路径", keyinput.can_type_natively("!"))
+    check("中文不能走原生路径", not keyinput.can_type_natively("中"))
+    check("多字符不算单字符", not keyinput.can_type_natively("ab"))
+
+    # 真打一遍。输入框是自己开的，不会打扰用户正在用的窗口。
+    root = tk.Tk()
+    root.geometry("420x130+80+80")
+    root.attributes("-topmost", True)
+    entry = tk.Entry(root, font=("Consolas", 16))
+    entry.pack(fill="both", expand=True, padx=20, pady=20)
+    root.deiconify()
+    root.update()
+    entry.focus_force()
+    for _ in range(20):
+        root.update()
+        time.sleep(0.02)
+
+    typist = keyinput.Typist()
+
+    def type_and_read(sample: str) -> str:
+        entry.delete(0, "end")
+        entry.focus_force()
+        root.update()
+        time.sleep(0.05)
+        typist.type_text(sample, char_delay_ms=12)
+        for _ in range(20):
+            root.update()
+            time.sleep(0.01)
+        return entry.get()
+
+    for sample in ("abcXYZ", "12345", "Hello123!"):
+        got = type_and_read(sample)
+        check(f"能打出 {sample!r}", got == sample, f"实际得到 {got!r}")
+
+    got = type_and_read("中文测试")
+    check("能打出中文（走 Unicode 通道）", got == "中文测试", f"实际得到 {got!r}")
+
+    got = type_and_read("混合abc中文123")
+    check("能打出中英数字混合", got == "混合abc中文123", f"实际得到 {got!r}")
+
+    # 中途停止
+    entry.delete(0, "end")
+    entry.focus_force()
+    root.update()
+    time.sleep(0.05)
+    typed = typist.type_text("abcdefghij", char_delay_ms=20, should_stop=lambda: True)
+    check("should_stop 能立刻中断输入", typed == 0, str(typed))
+
+    root.destroy()
+
+
 # ------------------------------------------------------------------ 采集抽稀
 
 
@@ -362,19 +564,26 @@ def test_hotkeys() -> None:
     app._start_capture("record")
     check("进入改键状态", app._capturing == "record", str(app._capturing))
     check("改键时按钮提示按下按键", "按下" in app._hotkey_buttons["record"].cget("text"))
-    app._apply_capture(kb.Key.f8)
-    check("热键已改成 F8", app.hotkeys["record"] == "<f8>", app.hotkeys["record"])
+    app._apply_capture(kb.Key.f6)
+    check("热键已改成 F6", app.hotkeys["record"] == "<f6>", app.hotkeys["record"])
     check("改键后退出采集状态", app._capturing is None, str(app._capturing))
-    check("按钮文字同步更新", app._hotkey_buttons["record"].cget("text") == "F8")
-    check("主按钮文字同步更新", "F8" in app.btn_record.cget("text"), app.btn_record.cget("text"))
+    check("按钮文字同步更新", app._hotkey_buttons["record"].cget("text") == "F6")
+    check("主按钮文字同步更新", "F6" in app.btn_record.cget("text"), app.btn_record.cget("text"))
 
     # 和别的功能撞键要被拒绝
     warnings.clear()
     app._start_capture("play")
-    app._apply_capture(kb.Key.f8)
+    app._apply_capture(kb.Key.f6)
     check("撞键被拒绝", len(warnings) == 1, str(warnings))
     check("撞键后原热键不变", app.hotkeys["play"] == "<f10>", str(app.hotkeys))
     check("撞键后退出采集状态", app._capturing is None, str(app._capturing))
+
+    # 取点热键也有自己的坑位，同样不能被抢
+    warnings.clear()
+    app._start_capture("record")
+    app._apply_capture(kb.Key.f8)
+    check("取点热键占用的键会被拒绝", len(warnings) == 1, str(warnings))
+    check("被拒后录制热键不变", app.hotkeys["record"] == "<f6>", app.hotkeys["record"])
 
     # Esc 取消
     app._start_capture("stop")
@@ -580,6 +789,345 @@ def test_editing() -> None:
     check("编辑功能接入后窗口正常关闭", True)
 
 
+def test_script_tab() -> None:
+    print("\n[剧本页签]")
+
+    import tkinter as tk
+
+    import mouse_macro
+    import script_model as sm
+
+    class Dummy:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    mouse_macro.keyboard.GlobalHotKeys = Dummy
+
+    root = tk.Tk()
+    root.withdraw()
+    mouse_macro._apply_scaling(root)
+    app = mouse_macro.MacroApp(root)
+    warnings: list[str] = []
+    app._warn = lambda message: warnings.append(message)
+
+    def settle(times: int = 6) -> None:
+        """把挂起的 Tk 事件跑完。
+
+        切页签会触发 <<NotebookTabChanged>>，而它是延迟派发的，
+        会重建列表并清掉选中。做依赖选中的操作之前必须先让它落定。
+        """
+        for _ in range(times):
+            root.update()
+            time.sleep(0.01)
+
+    settle()
+    check("默认停在录制页签", not app._on_script_tab())
+    check("一共两个页签", app.notebook.index("end") == 2, str(app.notebook.index("end")))
+
+    # 添加步骤（对话框打桩，避免模态窗口卡住测试）
+    app._edit_step_dialog = lambda step, index=None: sm.Step(
+        x=100, y=200, mouse=sm.MOUSE_RIGHT, text="admin", delay_ms=800
+    )
+    app.add_step()
+    for _ in range(3):
+        root.update()
+    check("添加步骤成功", len(app.steps) == 1, str(len(app.steps)))
+    check("列表渲染出步骤", len(app.step_tree.get_children()) == 1)
+    row = app.step_tree.item(app.step_tree.get_children()[0], "values")
+    check(
+        "步骤行内容正确",
+        row[1] == "100, 200" and row[2] == "右键单击" and row[3] == "admin" and row[4] == "800 ms",
+        str(row),
+    )
+    check("步数提示更新", app.var_step_count.get() == "共 1 步", app.var_step_count.get())
+
+    # 热键取点：按当前位置加一步，不弹对话框
+    app.quick_pick_step()
+    check("热键取点加了一步", len(app.steps) == 2, str(len(app.steps)))
+    check("热键取点默认左键单击", app.steps[-1].mouse == sm.MOUSE_LEFT, app.steps[-1].mouse)
+    check("热键取点会切到剧本页签", app._on_script_tab())
+    check("热键取到的坐标就是当前鼠标位置", (app.steps[-1].x, app.steps[-1].y) is not None)
+
+    # 对话框取消就不该添加
+    app._edit_step_dialog = lambda step, index=None: None
+    before = len(app.steps)
+    app.add_step()
+    check("取消对话框不添加步骤", len(app.steps) == before, str(len(app.steps)))
+
+    # 编辑
+    app._edit_step_dialog = lambda step, index=None: sm.Step(
+        x=7, y=8, mouse=sm.MOUSE_NONE, delay_ms=1
+    )
+    settle()
+    app.step_tree.selection_set(app.step_tree.get_children()[0])
+    settle(3)
+    check("编辑前选中确实生效", app._selected_step_indices() == [0], str(app._selected_step_indices()))
+    app.edit_step()
+    check("编辑生效", (app.steps[0].x, app.steps[0].y) == (7, 8), str(app.steps[0]))
+
+    # 调整顺序
+    app.steps = [sm.Step(x=i) for i in range(3)]
+    app._render_steps()
+    settle(3)
+    app.step_tree.selection_set(app.step_tree.get_children()[0])
+    settle(3)
+    app.move_step(1)
+    check("下移交换顺序", [s.x for s in app.steps] == [1, 0, 2], str([s.x for s in app.steps]))
+    app.move_step(-1)
+    check("上移换回来", [s.x for s in app.steps] == [0, 1, 2], str([s.x for s in app.steps]))
+    app.move_step(-1)
+    check("已经在顶部时上移无效", [s.x for s in app.steps] == [0, 1, 2], str([s.x for s in app.steps]))
+
+    # 删除
+    app.step_tree.selection_set(app.step_tree.get_children()[1])
+    for _ in range(2):
+        root.update()
+    app.delete_steps()
+    check("删除步骤", [s.x for s in app.steps] == [0, 2], str([s.x for s in app.steps]))
+
+    # 空选择时三处操作都要给提示，而不是静默
+    warnings.clear()
+    app.step_tree.selection_remove(*app.step_tree.selection())
+    for _ in range(2):
+        root.update()
+    app.delete_steps()
+    app.edit_step()
+    app.move_step(1)
+    check("没选中时都给出提示", len(warnings) == 3, str(warnings))
+
+    # 从剧本页签回放：内容必须先展开成动作
+    app.steps = [
+        sm.Step(x=11, y=22, mouse=sm.MOUSE_LEFT, delay_ms=0),
+        sm.Step(x=33, y=44, mouse=sm.MOUSE_NONE, delay_ms=0),
+    ]
+    app._render_steps()
+    captured: dict = {}
+
+    class FakePlayer:
+        running = False
+
+        def start(self, steps, **kwargs):
+            captured["steps"] = list(steps)
+            captured["kw"] = kwargs
+
+    real_player = app.player
+    app.player = FakePlayer()
+    app.start_play()
+    check(
+        "剧本回放会展开成动作",
+        [a.kind for a in captured["steps"]] == [KIND_MOVE, KIND_DOWN, KIND_UP, KIND_MOVE],
+        str([a.kind for a in captured["steps"]]),
+    )
+    check(
+        "展开后坐标正确",
+        [a.x for a in captured["steps"]] == [11, 11, 11, 33],
+        str([a.x for a in captured["steps"]]),
+    )
+    check("回放设置带上了输入方式", "native_typing" in captured["kw"], str(list(captured["kw"])))
+
+    app.step_tree.selection_set(app.step_tree.get_children()[1])
+    for _ in range(2):
+        root.update()
+    captured.clear()
+    app.play_from_selection()
+    check("剧本从选中步骤回放", [a.x for a in captured["steps"]] == [33], str([a.x for a in captured["steps"]]))
+
+    app.player = real_player
+    app._set_playing_ui(False)
+
+    # 录制页签为空时不给回放
+    app.notebook.select(0)
+    for _ in range(2):
+        root.update()
+    captured.clear()
+    warnings.clear()
+    app.start_play()
+    check("录制为空时给提示且不回放", len(warnings) == 1 and captured == {}, str(warnings))
+
+    # 保存 / 加载要跟着当前页签走
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, "s.json")
+    mouse_macro.filedialog.asksaveasfilename = lambda **kwargs: path
+    app.notebook.select(1)
+    for _ in range(2):
+        root.update()
+    app.steps = [sm.Step(x=5, y=6, text="hi")]
+    app._render_steps()
+    app.save_macro()
+    check("剧本页签保存出文件", os.path.isfile(path))
+    kind, data, _ = sm.load_any(path)
+    check("存下来的是剧本格式", kind == KIND_SCRIPT, kind)
+    check("存下来的步骤正确", data == [sm.Step(x=5, y=6, text="hi")], str(data))
+
+    app.steps = []
+    app._render_steps()
+    app.notebook.select(0)
+    for _ in range(2):
+        root.update()
+    mouse_macro.filedialog.askopenfilename = lambda **kwargs: path
+    app.load_macro()
+    check("加载剧本后自动切到剧本页签", app._on_script_tab())
+    check("加载的步骤正确", len(app.steps) == 1 and app.steps[0].x == 5, str(app.steps))
+
+    # 清空
+    app.clear_steps()
+    check("清空剧本", app.steps == [] and len(app.step_tree.get_children()) == 0)
+
+    # 剧本工具栏必须放得下，否则最右边几个按钮会被裁掉
+    app.notebook.select(1)
+    root.geometry(f"{root.minsize()[0]}x{root.minsize()[1]}")
+    root.deiconify()
+    settle(12)
+    bar = app._step_bar
+    check(
+        "最小尺寸下剧本工具栏放得下",
+        bar.winfo_reqwidth() <= app.notebook.winfo_width(),
+        f"工具栏需要 {bar.winfo_reqwidth()}px，可用 {app.notebook.winfo_width()}px",
+    )
+    root.withdraw()
+    settle(3)
+
+    app._on_close()
+    check("剧本页签窗口正常关闭", True)
+
+
+def test_step_dialog() -> None:
+    print("\n[步骤对话框]")
+
+    import tkinter as tk
+
+    import step_dialog
+    from step_dialog import StepDialog
+
+    import script_model as sm
+
+    root = tk.Tk()
+    root.withdraw()
+
+    original_warn = step_dialog.messagebox.showwarning
+    seen: list = []
+    step_dialog.messagebox.showwarning = lambda *a, **k: seen.append(a)
+
+    # 编辑已有步骤：字段要预填
+    original = sm.Step(x=100, y=200, mouse=sm.MOUSE_DOUBLE, text="abc", delay_ms=700)
+    dlg = StepDialog(root, original, 2)
+    for _ in range(8):
+        root.update()
+    check("预填坐标", (dlg.var_x.get(), dlg.var_y.get()) == ("100", "200"), dlg.var_x.get())
+    check("预填鼠标动作", dlg.var_mouse.get() == "双击", dlg.var_mouse.get())
+    check("预填输入文字", dlg.var_text.get() == "abc", dlg.var_text.get())
+    check("预填延时", dlg.var_delay.get() == "700", dlg.var_delay.get())
+    dlg._confirm()
+    check("确定后原样返回步骤", dlg.result == original, str(dlg.result))
+
+    # 新建：默认值
+    dlg = StepDialog(root)
+    for _ in range(5):
+        root.update()
+    check("新建默认左键单击", dlg.var_mouse.get() == "左键单击", dlg.var_mouse.get())
+    check("新建默认延时是 500", dlg.var_delay.get() == str(sm.DEFAULT_DELAY_MS), dlg.var_delay.get())
+    check("新建默认没有输入文字", dlg.var_text.get() == "")
+
+    dlg._cancel()
+    check("取消返回 None", dlg.result is None, str(dlg.result))
+
+    # 所有鼠标动作都能选中
+    dlg = StepDialog(root)
+    for _ in range(5):
+        root.update()
+    options = list(dlg.winfo_children())  # 只是确认窗口建起来了
+    check("对话框建起来了", bool(options))
+    for key in sm.MOUSE_ACTIONS:
+        dlg.var_mouse.set(sm.MOUSE_ACTION_CN[key])
+        dlg.var_x.set("10")
+        dlg.var_y.set("20")
+        dlg.var_delay.set("0")
+        seen.clear()
+        dlg._confirm()
+        check(
+            f"{sm.MOUSE_ACTION_CN[key]}能正常确定",
+            dlg.result is not None and dlg.result.mouse == key,
+            f"{dlg.result} / 警告 {seen}",
+        )
+        if key != sm.MOUSE_ACTIONS[-1]:
+            dlg = StepDialog(root, dlg.result)
+            for _ in range(3):
+                root.update()
+    dlg._cancel()
+
+    # 非法输入要被拦下，而不是把坏数据写进去
+    dlg = StepDialog(root)
+    for _ in range(5):
+        root.update()
+
+    seen.clear()
+    dlg.var_x.set("不是数字")
+    dlg._confirm()
+    check("非法 X 被拦下", dlg.result is None and len(seen) == 1, f"{dlg.result} / {seen}")
+
+    dlg.var_x.set("10")
+    dlg.var_y.set("")
+    seen.clear()
+    dlg._confirm()
+    check("空 Y 被拦下", dlg.result is None and len(seen) == 1, f"{dlg.result} / {seen}")
+
+    dlg.var_y.set("20")
+    dlg.var_delay.set("-5")
+    seen.clear()
+    dlg._confirm()
+    check("负延时被拦下", dlg.result is None and len(seen) == 1, f"{dlg.result} / {seen}")
+
+    dlg.var_delay.set("abc")
+    seen.clear()
+    dlg._confirm()
+    check("非数字延时被拦下", dlg.result is None and len(seen) == 1, f"{dlg.result} / {seen}")
+
+    dlg.var_delay.set("300")
+    dlg.var_x.set("70000")
+    seen.clear()
+    dlg._confirm()
+    check("超范围坐标被拦下", dlg.result is None and len(seen) == 1, f"{dlg.result} / {seen}")
+
+    # 负坐标是合法的（副屏在主屏左边就是负数）
+    dlg.var_x.set("-1500")
+    dlg.var_y.set("300")
+    dlg.var_delay.set("0")
+    dlg.var_text.set("中文输入 ok")
+    dlg._confirm()
+    check(
+        "负坐标和中文输入都能通过",
+        dlg.result is not None and dlg.result.x == -1500 and dlg.result.text == "中文输入 ok",
+        str(dlg.result),
+    )
+
+    # 超长文字要被截断，免得文件失控
+    dlg = StepDialog(root, sm.Step(x=0, y=0, text="x" * 5000, delay_ms=0))
+    for _ in range(3):
+        root.update()
+    dlg._confirm()
+    check("超长输入被截断", dlg.result is not None and len(dlg.result.text) == 2000, str(len(dlg.result.text or "")))
+
+    # 小数会被取整
+    dlg = StepDialog(root, sm.Step(x=0, y=0, delay_ms=0))
+    for _ in range(3):
+        root.update()
+    dlg.var_x.set("100.7")
+    dlg.var_delay.set("250.9")
+    dlg._confirm()
+    check("小数坐标被取整", dlg.result is not None and dlg.result.x == 100, str(dlg.result))
+    check("小数延时被取整", dlg.result is not None and dlg.result.delay_ms == 250, str(dlg.result))
+
+    step_dialog.messagebox.showwarning = original_warn
+    root.destroy()
+    check("对话框测试结束", True)
+
+
 def test_main_entry() -> None:
     print("\n[入口]")
     import mouse_macro
@@ -756,7 +1304,17 @@ def test_gui() -> None:
     app.var_speed.set(2.0)
     app.var_gap.set(300)
     settings = app._read_settings()
-    check("设置读取正确", settings == {"repeat": 5, "speed": 2.0, "gap_ms": 300, "use_moves": True}, str(settings))
+    check(
+        "设置读取正确",
+        settings == {
+            "repeat": 5,
+            "speed": 2.0,
+            "gap_ms": 300,
+            "use_moves": True,
+            "native_typing": False,
+        },
+        str(settings),
+    )
 
     app.var_infinite.set(True)
     check("无限循环映射为 repeat=0", app._read_settings()["repeat"] == 0)
@@ -781,12 +1339,16 @@ def main() -> int:
     print("鼠标宏自检")
     test_model()
     test_remove_actions()
+    test_script_model()
+    test_keyinput()
     test_recorder()
     test_recorder_stats()
     test_player()
     test_gui()
     test_hotkeys()
     test_editing()
+    test_script_tab()
+    test_step_dialog()
     test_main_entry()
 
     print(f"\n通过 {PASSED} 项，失败 {len(FAILED)} 项。")

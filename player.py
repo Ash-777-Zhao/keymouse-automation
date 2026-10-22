@@ -15,7 +15,16 @@ from typing import Callable, Sequence
 
 from pynput.mouse import Button, Controller
 
-from macro_model import KIND_DOWN, KIND_MOVE, KIND_SCROLL, KIND_UP, Action
+from keyinput import Typist
+from macro_model import (
+    KIND_DOWN,
+    KIND_MOVE,
+    KIND_SCROLL,
+    KIND_TYPE,
+    KIND_UP,
+    TYPE_CHAR_MS,
+    Action,
+)
 
 MIN_SPEED = 0.05
 MAX_SPEED = 20.0
@@ -45,8 +54,13 @@ class Player:
 
     def __init__(self) -> None:
         self._controller = Controller()
+        try:
+            self._typist: Typist | None = Typist()
+        except Exception:
+            self._typist = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._native_typing = False
 
     @property
     def running(self) -> bool:
@@ -60,10 +74,15 @@ class Player:
         speed: float = 1.0,
         gap_ms: int = 0,
         use_moves: bool = True,
+        native_typing: bool = False,
         on_progress: ProgressFn | None = None,
         on_done: DoneFn | None = None,
     ) -> None:
-        """repeat=0 表示无限循环；speed 是倍速（2.0 = 快一倍）。"""
+        """repeat=0 表示无限循环；speed 是倍速（2.0 = 快一倍）。
+
+        native_typing=True 时键盘输入走模拟真实按键的路径，
+        只在目标程序不认 KEYEVENTF_UNICODE 时才需要（会被输入法干扰）。
+        """
         if self.running:
             raise RuntimeError("回放已在进行中。")
 
@@ -71,6 +90,7 @@ class Player:
         if not steps:
             raise ValueError("没有可以回放的动作。")
 
+        self._native_typing = bool(native_typing)
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
@@ -130,7 +150,7 @@ class Player:
                             aborted = True
                             break
                         previous_t = action.t
-                    self._dispatch(action, held)
+                    self._dispatch(action, held, speed)
                     if on_progress and (index % _PROGRESS_EVERY == 0 or index == total - 1):
                         on_progress(iteration, repeat, index + 1, total)
 
@@ -151,7 +171,7 @@ class Player:
                 except Exception:
                     pass
 
-    def _dispatch(self, action: Action, held: list[Button]) -> None:
+    def _dispatch(self, action: Action, held: list[Button], speed: float) -> None:
         if action.kind == KIND_MOVE:
             self._controller.position = (action.x, action.y)
         elif action.kind == KIND_DOWN:
@@ -168,6 +188,17 @@ class Player:
         elif action.kind == KIND_SCROLL:
             self._controller.position = (action.x, action.y)
             self._controller.scroll(action.dx, action.dy)
+        elif action.kind == KIND_TYPE:
+            self._controller.position = (action.x, action.y)
+            if self._typist is None:
+                raise RuntimeError("键盘输入不可用，无法执行输入动作。")
+            # 打字速度也跟着倍速走，否则整个时间轴会前后对不上
+            self._typist.type_text(
+                action.text,
+                TYPE_CHAR_MS / speed,
+                should_stop=self._stop.is_set,
+                native=self._native_typing,
+            )
 
     def _sleep(self, seconds: float) -> bool:
         """分片睡眠，以便随时响应停止。返回 False 表示被打断。"""
